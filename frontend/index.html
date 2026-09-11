@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Image to Vector</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="masthead">
+    <h1>Image&nbsp;&rarr;&nbsp;Vector</h1>
+    <p class="tagline">Raster artwork to real SVG paths. No embedded bitmaps.</p>
+    <div class="status-strip">
+      <span id="engineStatus" class="badge badge--pending">checking engine&hellip;</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- ── 1. Upload ────────────────────────────────────────────────── -->
+    <section class="panel">
+      <h2><span class="step">1</span> Choose an image</h2>
+
+      <div id="dropZone" class="dropzone" tabindex="0" role="button"
+           aria-label="Drop an image here or press Enter to browse">
+        <svg class="dropzone__icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 16V4m0 0L8 8m4-4 4 4M4 16v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/>
+        </svg>
+        <p class="dropzone__title">Drag &amp; drop an image here</p>
+        <p class="dropzone__hint">or</p>
+        <button type="button" id="browseBtn" class="btn btn--ghost">Choose image</button>
+        <p class="dropzone__formats">PNG &middot; JPG &middot; JPEG &middot; WebP &middot; up to 15&nbsp;MB</p>
+        <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp" hidden>
+      </div>
+
+      <div id="fileMeta" class="file-meta" hidden>
+        <div class="file-meta__thumb">
+          <img id="thumbPreview" alt="Selected image preview">
+        </div>
+        <dl class="file-meta__facts">
+          <div><dt>Name</dt><dd id="fileName">&mdash;</dd></div>
+          <div><dt>Size</dt><dd id="fileSize">&mdash;</dd></div>
+          <div><dt>Dimensions</dt><dd id="fileDims">&mdash;</dd></div>
+          <div><dt>Type</dt><dd id="fileType">&mdash;</dd></div>
+        </dl>
+        <button type="button" id="clearBtn" class="btn btn--text">Remove</button>
+      </div>
+    </section>
+
+    <!-- ── 2. Settings ──────────────────────────────────────────────── -->
+    <section class="panel">
+      <h2><span class="step">2</span> Vectorization settings</h2>
+
+      <div class="field">
+        <label for="presetSelect">Preset</label>
+        <select id="presetSelect">
+          <option value="auto">Auto (detect image type)</option>
+          <option value="standard">Standard - balanced colour tracing</option>
+          <option value="logo">Logo / emblem - flat colours + crisp lettering</option>
+          <option value="flat_art">Flat art - quantized flat-colour graphics</option>
+          <option value="typography">Typography - lettering &amp; logos</option>
+          <option value="line_art">Line art - 1-bit strokes &amp; doodles</option>
+          <option value="detailed">Detailed - dense or textured artwork</option>
+        </select>
+        <p id="presetHelp" class="field__help">
+          Inspects the image and picks a preset for you.
+        </p>
+      </div>
+
+      <div class="field">
+        <label for="backgroundSelect">Background</label>
+        <select id="backgroundSelect">
+          <option value="">Use the preset's default</option>
+          <option value="auto">Auto - remove only if clearly flat</option>
+          <option value="always">Always remove</option>
+          <option value="never">Keep the background</option>
+        </select>
+        <p class="field__help">
+          Removal is a flood fill from the image border, so artwork that merely
+          shares the background colour is not touched.
+        </p>
+      </div>
+
+      <div class="field field--check">
+        <label class="checkbox">
+          <input type="checkbox" id="enclosedCheck">
+          <span>Also knock out enclosed background areas</span>
+        </label>
+        <p class="field__help">
+          Turns letter counters (the holes in <strong>B</strong>, <strong>O</strong>,
+          <strong>e</strong>) into true transparent cutouts. Leave off if your
+          artwork has genuine dark areas matching the background.
+        </p>
+      </div>
+
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <div class="field">
+          <label for="maxDimInput">Max dimension (px)</label>
+          <input type="number" id="maxDimInput" min="256" max="3000" step="100"
+                 placeholder="preset default">
+          <p class="field__help">
+            Working resolution of the artwork. Higher keeps more detail but
+            produces more paths and takes longer.
+          </p>
+        </div>
+        <div class="field">
+          <label for="supersampleInput">Supersampling</label>
+          <select id="supersampleInput">
+            <option value="">Use the preset's default</option>
+            <option value="1">1x - off (fastest)</option>
+            <option value="1.5">1.5x</option>
+            <option value="2">2x - smoothest edges</option>
+          </select>
+          <p class="field__help">
+            Traces at a higher resolution and scales back down via the viewBox.
+            This is what keeps curves and letterform corners smooth; turning it
+            off is faster but visibly blockier.
+          </p>
+        </div>
+      </details>
+
+      <button type="button" id="vectorizeBtn" class="btn btn--primary" disabled>
+        Vectorize
+      </button>
+    </section>
+
+    <!-- ── Status ───────────────────────────────────────────────────── -->
+    <div id="progress" class="progress" hidden>
+      <div class="spinner" aria-hidden="true"></div>
+      <div>
+        <p class="progress__title">Vectorizing&hellip;</p>
+        <p class="progress__detail" id="progressDetail">Sending the image to the engine</p>
+      </div>
+    </div>
+
+    <div id="errorBox" class="alert alert--error" hidden role="alert">
+      <strong id="errorTitle">Something went wrong</strong>
+      <p id="errorMessage"></p>
+      <code id="errorCode" class="alert__code"></code>
+    </div>
+
+    <div id="warningBox" class="alert alert--warn" hidden>
+      <strong>Notes about this result</strong>
+      <ul id="warningList"></ul>
+    </div>
+
+    <!-- ── 3. Result ────────────────────────────────────────────────── -->
+    <section class="panel" id="resultPanel" hidden>
+      <h2><span class="step">3</span> Result</h2>
+
+      <div class="backdrop-toggle" role="group" aria-label="Preview backdrop">
+        <span class="backdrop-toggle__label">Backdrop</span>
+        <button type="button" class="chip is-active" data-backdrop="checker">Checker</button>
+        <button type="button" class="chip" data-backdrop="light">Light</button>
+        <button type="button" class="chip" data-backdrop="dark">Dark</button>
+      </div>
+
+      <div class="compare">
+        <figure class="compare__side">
+          <figcaption>Original raster</figcaption>
+          <div class="canvas backdrop backdrop--checker">
+            <img id="originalPreview" alt="Original image">
+          </div>
+        </figure>
+        <figure class="compare__side">
+          <figcaption>Generated SVG</figcaption>
+          <div class="canvas backdrop backdrop--checker">
+            <img id="svgPreview" alt="Vectorized result">
+          </div>
+        </figure>
+      </div>
+
+      <div class="zoom-note">
+        Zoom the SVG to check the edges stay crisp &mdash; that is the proof it is
+        real geometry.
+      </div>
+
+      <dl class="stats" id="statsGrid"></dl>
+
+      <div class="actions">
+        <button type="button" id="downloadBtn" class="btn btn--primary">Download SVG</button>
+        <button type="button" id="openBtn" class="btn btn--ghost">Open in new tab</button>
+        <button type="button" id="copyBtn" class="btn btn--ghost">Copy SVG markup</button>
+      </div>
+
+      <details class="advanced">
+        <summary>Engine report (JSON)</summary>
+        <pre id="metaDump" class="meta-dump"></pre>
+      </details>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>
+      POC &middot; Node API on <code>:5000</code> &middot; Python engine on
+      <code>:8000</code> &middot; VTracer (CPU)
+    </p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

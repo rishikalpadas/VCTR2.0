@@ -1,0 +1,48 @@
+# ---- Node ----------------------------------------------------------------
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.npm/
+
+# ---- Python --------------------------------------------------------------
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Secrets / local config ----------------------------------------------
+.env
+.env.local
+.env.*.local
+# .env.example files ARE tracked - they document the settings.
+!.env.example
+
+# ---- Runtime artifacts ---------------------------------------------------
+# User uploads and generated SVGs: transient, never committed.
+server/uploads/*
+!server/uploads/.gitkeep
+server/outputs/*
+!server/outputs/.gitkeep
+
+# Generated test fixtures (recreate with: npm run samples)
+samples/sample_*
+samples/logo_repro.*
+samples/out/
+
+# Quality-harness scratch output (see python-engine/tests/quality_harness.py)
+frontend/_quality.html
+frontend/_*.jpg
+frontend/_*.png
+
+# ---- Editor / OS ---------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# Image-to-Vector POC - Python vectorization service
+#
+# Verified on Windows 10 / Python 3.12 (CPU only, no CUDA required).
+#
+# NOTE ON PYTHON VERSION:
+#   vtracer ships pre-built wheels for CPython 3.8 - 3.13.
+#   Python 3.14 has no wheel yet and would require a Rust toolchain to build.
+#   Use Python 3.12 (recommended) or 3.13.
+# ---------------------------------------------------------------------------
+
+# --- Web service -----------------------------------------------------------
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32
+pydantic==2.13.5
+pydantic-settings==2.15.0
+
+# --- Image processing ------------------------------------------------------
+pillow==12.3.0
+numpy==2.5.3
+opencv-python-headless==5.0.0.93
+scikit-image==0.26.0
+
+# --- Vectorization engine --------------------------------------------------
+# VTracer (Rust core, Python bindings). CPU only.
+vtracer==0.6.15
+
+# --- SVG optimization ------------------------------------------------------
+scour==0.38.2
