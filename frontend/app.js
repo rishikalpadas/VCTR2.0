@@ -9,6 +9,7 @@
   var API = {
     health: '/api/health',
     vectorize: '/api/vectorize',
+    exportPdf: '/api/export/pdf',
   };
 
   var MAX_BYTES = 15 * 1024 * 1024;
@@ -33,7 +34,8 @@
     'vectorizeBtn', 'progress',
     'progressDetail', 'errorBox', 'errorTitle', 'errorMessage', 'errorCode',
     'warningBox', 'warningList', 'resultPanel', 'originalPreview', 'svgPreview',
-    'statsGrid', 'downloadBtn', 'openBtn', 'copyBtn', 'metaDump', 'engineStatus',
+    'statsGrid', 'downloadBtn', 'downloadPdfBtn', 'openBtn', 'copyBtn', 'metaDump',
+    'engineStatus',
   ].forEach(function (id) { el[id] = document.getElementById(id); });
 
   // --- state --------------------------------------------------------------
@@ -45,6 +47,7 @@
     svgText: null,
     meta: null,
     busy: false,
+    exporting: false,
   };
 
   // --- helpers ------------------------------------------------------------
@@ -310,17 +313,71 @@
 
   // --- output actions -----------------------------------------------------
 
-  function downloadSvg() {
-    if (!state.svgUrl) return;
-    var base = (state.file && state.file.name ? state.file.name : 'artwork')
+  function baseName() {
+    return (state.file && state.file.name ? state.file.name : 'artwork')
       .replace(/\.[^.]+$/, '')
-      .replace(/[^a-z0-9_-]+/gi, '-');
+      .replace(/[^a-z0-9_-]+/gi, '-') || 'artwork';
+  }
+
+  function triggerDownload(href, filename, revokeAfter) {
     var link = document.createElement('a');
-    link.href = state.svgUrl;
-    link.download = base + '.svg';
+    link.href = href;
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    if (revokeAfter) {
+      setTimeout(function () { revoke(href); }, 10000);
+    }
+  }
+
+  function downloadSvg() {
+    if (!state.svgUrl) return;
+    triggerDownload(state.svgUrl, baseName() + '.svg', false);
+  }
+
+  /**
+   * PDF is produced server-side from the SVG we already have, so it matches
+   * the preview exactly and costs no re-trace.
+   */
+  function downloadPdf() {
+    if (!state.svgText || state.exporting) return;
+
+    var button = el.downloadPdfBtn;
+    var original = button.textContent;
+    state.exporting = true;
+    button.disabled = true;
+    button.textContent = 'Preparing PDF…';
+    clearError();
+
+    fetch(API.exportPdf + '?name=' + encodeURIComponent(baseName()), {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/svg+xml' },
+      body: state.svgText,
+    })
+      .then(function (res) {
+        if (res.ok) return res.blob();
+        return res.json()
+          .catch(function () {
+            throw new Error('PDF export failed (HTTP ' + res.status + ').');
+          })
+          .then(function (body) {
+            var err = new Error((body.error && body.error.message) || 'PDF export failed.');
+            err.code = body.error && body.error.code;
+            throw err;
+          });
+      })
+      .then(function (blob) {
+        triggerDownload(URL.createObjectURL(blob), baseName() + '.pdf', true);
+      })
+      .catch(function (err) {
+        showError(err.message || 'Could not export the PDF.', err.code || 'PDF_EXPORT_FAILED');
+      })
+      .finally(function () {
+        state.exporting = false;
+        button.disabled = false;
+        button.textContent = original;
+      });
   }
 
   function copySvg() {
@@ -386,6 +443,7 @@
   el.clearBtn.addEventListener('click', clearFile);
   el.vectorizeBtn.addEventListener('click', vectorize);
   el.downloadBtn.addEventListener('click', downloadSvg);
+  el.downloadPdfBtn.addEventListener('click', downloadPdf);
   el.copyBtn.addEventListener('click', copySvg);
 
   el.openBtn.addEventListener('click', function () {

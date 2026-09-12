@@ -25,11 +25,17 @@ from PIL import Image, ImageDraw  # noqa: E402
 from analysis import ImageKind, analyze  # noqa: E402
 from errors import (  # noqa: E402
     CorruptImageError,
+    InvalidSvgError,
     UnknownPresetError,
     UnsupportedFormatError,
 )
 import pathstats  # noqa: E402
 from presets import get_preset  # noqa: E402
+from svg_export import (  # noqa: E402
+    MAX_SVG_BYTES,
+    _count_curve_operators,
+    svg_to_pdf,
+)
 from svg_optimizer import validate_svg  # noqa: E402
 from vectorizer import vectorize_bytes  # noqa: E402
 
@@ -437,6 +443,77 @@ class TestCurveQuality(unittest.TestCase):
         self.assertLessEqual(
             self._fill_count(smoothed.svg), self._fill_count(raw.svg)
         )
+
+
+class TestPdfExport(unittest.TestCase):
+    """The PDF has to be vector too, or the export defeats the point."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.outcome = vectorize_bytes(png_bytes(donut()), preset_name="flat_art")
+        cls.pdf = svg_to_pdf(cls.outcome.svg)
+
+    def test_is_a_pdf(self):
+        self.assertTrue(self.pdf.startswith(b"%PDF-"))
+
+    def test_contains_no_raster_image(self):
+        self.assertIsNone(re.search(rb"/Subtype\s*/Image", self.pdf))
+
+    def test_contains_bezier_geometry(self):
+        """A PDF of a traced donut should be mostly curve operators."""
+        curves = _count_curve_operators(self.pdf)
+        self.assertGreater(
+            curves, 20, f"only {curves} Bezier operators - is this really vector?"
+        )
+
+    def test_page_size_follows_the_artwork(self):
+        """902px at 96dpi should become 676.5pt, not a default A4 page."""
+        image = Image.new("RGB", (800, 400), (240, 240, 240))
+        ImageDraw.Draw(image).ellipse((40, 40, 360, 360), fill=(200, 40, 40))
+        outcome = vectorize_bytes(png_bytes(image), preset_name="flat_art")
+        pdf = svg_to_pdf(outcome.svg)
+
+        box = re.search(rb"/MediaBox\s*\[\s*([\d.\s]+)\]", pdf)
+        self.assertIsNotNone(box, "no MediaBox in the PDF")
+        numbers = [float(n) for n in box.group(1).split()]
+        width, height = numbers[2] - numbers[0], numbers[3] - numbers[1]
+        # 800 x 400 css px -> 600 x 300 pt at the 0.75 css-px-to-point ratio.
+        self.assertAlmostEqual(width, 600, delta=2)
+        self.assertAlmostEqual(height, 300, delta=2)
+
+    def test_rejects_entity_declarations(self):
+        """Billion laughs: lxml expands internal entities."""
+        hostile = (
+            '<?xml version="1.0"?>'
+            '<!DOCTYPE svg [<!ENTITY a "aaaaaaaaaa">]>'
+            '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+            '<path d="M0 0 L5 5 Z"/></svg>'
+        )
+        with self.assertRaises(InvalidSvgError):
+            svg_to_pdf(hostile)
+
+    def test_rejects_external_references(self):
+        """svglib resolves href targets, including over the network."""
+        hostile = (
+            '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+            '<image href="http://169.254.169.254/latest/meta-data/" '
+            'width="10" height="10"/></svg>'
+        )
+        with self.assertRaises(InvalidSvgError):
+            svg_to_pdf(hostile)
+
+    def test_rejects_oversized_input(self):
+        padding = " " * (MAX_SVG_BYTES + 1024)
+        with self.assertRaises(InvalidSvgError):
+            svg_to_pdf(f'<svg xmlns="http://www.w3.org/2000/svg">{padding}</svg>')
+
+    def test_rejects_non_svg(self):
+        with self.assertRaises(InvalidSvgError):
+            svg_to_pdf("<html><body>not an svg</body></html>")
+
+    def test_rejects_empty_input(self):
+        with self.assertRaises(InvalidSvgError):
+            svg_to_pdf("   ")
 
 
 class TestDeterminism(unittest.TestCase):

@@ -123,6 +123,56 @@ async function vectorize(req, res, next) {
   }
 }
 
+/** POST /api/export/pdf - body is the SVG text, response is the PDF. */
+async function exportPdf(req, res, next) {
+  try {
+    const svg = typeof req.body === 'string' ? req.body : '';
+
+    if (!svg.trim()) {
+      throw ApiError.badRequest(
+        'NO_SVG',
+        'No SVG was supplied. Vectorize an image first, then export it.',
+      );
+    }
+    if (Buffer.byteLength(svg, 'utf8') > config.export.maxSvgBytes) {
+      throw ApiError.payloadTooLarge(
+        `That SVG is too large to export. The limit is `
+        + `${Math.round(config.export.maxSvgBytes / (1024 * 1024))} MB.`,
+      );
+    }
+    if (!svg.includes('<svg')) {
+      throw ApiError.badRequest('INVALID_SVG', 'That does not look like an SVG document.');
+    }
+
+    const pdf = await pythonService.exportPdf(svg);
+    const name = sanitizeFilename(req.query.name) || 'artwork';
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Length', pdf.length);
+    res.setHeader('Content-Disposition', `attachment; filename="${name}.pdf"`);
+    res.send(pdf);
+  } catch (err) {
+    next(err);
+  }
+}
+
+/**
+ * Filenames reach us from the browser, and this one goes straight into a
+ * Content-Disposition header. Strip anything that could break out of the
+ * quoted string or inject a second header.
+ */
+function sanitizeFilename(value) {
+  if (typeof value !== 'string') return '';
+  return value
+    .replace(/\.[^.]+$/, '')
+    // Spaces become hyphens so the PDF name matches the SVG one the frontend
+    // builds, rather than the two downloads differing for the same artwork.
+    .replace(/[^a-zA-Z0-9_-]+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^-|-$/g, '')
+    .slice(0, 64);
+}
+
 /** GET /api/health */
 async function health(req, res) {
   const payload = {
@@ -155,4 +205,4 @@ async function presets(req, res, next) {
   }
 }
 
-module.exports = { vectorize, health, presets };
+module.exports = { vectorize, exportPdf, health, presets };

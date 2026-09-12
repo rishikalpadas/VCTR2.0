@@ -85,7 +85,7 @@ image-to-vector-poc/
 │   │   ├── upload.js           multer + magic-byte verification + cleanup
 │   │   └── errorHandler.js     log detail, return safe messages
 │   ├── utils/{logger,ApiError}.js
-│   ├── test/api.test.js        node:test suite (14 tests)
+│   ├── test/api.test.js        node:test suite (18 tests)
 │   ├── uploads/                transient, wiped after every request
 │   └── outputs/                only used when PERSIST_OUTPUTS=true
 │
@@ -97,6 +97,7 @@ image-to-vector-poc/
 │   ├── background.py           border flood fill + enclosed-region removal
 │   ├── presets.py              the tuning table
 │   ├── svg_optimizer.py        viewBox, artifact culling, scour, validation
+│   ├── svg_export.py           SVG -> vector PDF (svglib + reportlab)
 │   ├── image_io.py             safe decoding
 │   ├── config.py, errors.py, logging_config.py, schemas.py
 │   ├── engines/
@@ -105,7 +106,7 @@ image-to-vector-poc/
 │   │   ├── photo_extractor.py  V2 garment-photo pipeline (stubbed, documented)
 │   │   └── future_engines.py   StarVector / Adobe placeholders
 │   ├── tests/
-│   │   ├── test_pipeline.py    42 tests incl. precision, curve, palette + background regressions
+│   │   ├── test_pipeline.py    51 tests incl. precision, curve, palette, PDF + background regressions
 │   │   ├── make_samples.py     synthetic fixtures
 │   │   ├── make_logo_repro.py  dark-field serif emblem repro
 │   │   ├── make_badge_repro.py circular badge repro (curve quality)
@@ -192,12 +193,43 @@ Failure — always this shape, never a stack trace:
 | `UNKNOWN_PRESET` | 400 | bad preset name |
 | `ENGINE_UNAVAILABLE` | 503 | Python service not running |
 | `ENGINE_TIMEOUT` | 504 | exceeded `PYTHON_TIMEOUT_MS` |
-| `INVALID_SVG` | 500 | output failed validation |
+| `INVALID_SVG` | 400/500 | output failed validation, or an SVG submitted for export was rejected |
+| `NO_SVG` | 400 | export called with an empty body |
+| `PDF_EXPORT_FAILED` | 500 | SVG parsed but could not be rendered to PDF |
 | `ENGINE_NOT_IMPLEMENTED` | 501 | a planned engine was selected |
 
-The Python service also exposes `GET /health`, `GET /presets`, `GET /engines`
-and `POST /vectorize` directly on `:8000`, plus interactive docs at
-<http://127.0.0.1:8000/docs>.
+### `POST /api/export/pdf`
+
+Converts an already-generated SVG into a single-page **vector** PDF.
+
+```
+Content-Type: image/svg+xml
+Body:        the SVG text
+Query:       ?name=my-artwork   (optional, used for the download filename)
+->           application/pdf
+```
+
+It takes the SVG rather than re-tracing the original raster, so the PDF matches
+exactly what was previewed and costs milliseconds instead of repeating a
+multi-second trace.
+
+The PDF is real geometry, not a page with a picture on it: measured on a badge,
+1376 Bezier operators and no image XObject. `svg_export._assert_vector_pdf`
+enforces that, the same way `svg_optimizer.validate_svg` does for the SVG.
+
+Page size follows the artwork: svglib converts CSS pixels to points at 0.75
+(96 dpi -> 72 dpi), so 902x908 px becomes a 676.5 x 681 pt page - 9.4 inches,
+the physically correct size rather than an arbitrary A4 fit.
+
+The SVG arrives back from the browser, so it is treated as untrusted input
+even though this service produced it. Rejected before any parser sees it:
+DOCTYPE/ENTITY declarations (lxml expands internal entities - billion laughs),
+any `href`/`xlink:href` (svglib resolves those over the network, which would
+make this an SSRF gadget), embedded rasters, and anything over 8 MB.
+
+The Python service also exposes `GET /health`, `GET /presets`, `GET /engines`,
+`POST /vectorize` and `POST /export/pdf` directly on `:8000`, plus interactive
+docs at <http://127.0.0.1:8000/docs>.
 
 ---
 
@@ -337,7 +369,7 @@ the GPU and credential constraints each brings.
 
 ## 9. Testing
 
-### Python (42 tests)
+### Python (51 tests)
 
 ```bat
 cd python-engine
@@ -351,7 +383,7 @@ hole/cutout geometry, every preset, coordinate-precision regressions,
 background-removal safety, supersampling behaviour, and the line-art
 binarization bug - all described under Implementation notes.
 
-### Node (14 tests)
+### Node (18 tests)
 
 ```bat
 cd server

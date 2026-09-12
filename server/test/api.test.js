@@ -260,6 +260,82 @@ test('the auto preset resolves to a concrete preset', async (t) => {
   return undefined;
 });
 
+// ---------------------------------------------------------------------------
+// PDF export
+// ---------------------------------------------------------------------------
+
+test('POST /api/export/pdf rejects an empty body', async () => {
+  const res = await fetch(`${baseUrl}/api/export/pdf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'image/svg+xml' },
+    body: '',
+  });
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assert.equal(body.error.code, 'NO_SVG');
+});
+
+test('POST /api/export/pdf rejects something that is not an SVG', async () => {
+  const res = await fetch(`${baseUrl}/api/export/pdf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'image/svg+xml' },
+    body: '<html><body>nope</body></html>',
+  });
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assert.equal(body.error.code, 'INVALID_SVG');
+});
+
+test('POST /api/export/pdf returns a vector PDF', async (t) => {
+  if (!engineUp) return t.skip('Python engine not running');
+
+  const sample = readSample('sample_flat_art.png');
+  if (!sample) return t.skip('sample images not generated');
+
+  // Vectorize first, then export exactly what came back.
+  const form = formWith(sample, 'sample.png', 'image/png', { preset: 'flat_art' });
+  const vectorized = await (
+    await fetch(`${baseUrl}/api/vectorize`, { method: 'POST', body: form })
+  ).json();
+
+  const res = await fetch(`${baseUrl}/api/export/pdf?name=my%20artwork.svg`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'image/svg+xml' },
+    body: vectorized.svg,
+  });
+
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type'), /application\/pdf/);
+  assert.match(res.headers.get('content-disposition'), /filename="my-artwork\.pdf"/);
+
+  const pdf = Buffer.from(await res.arrayBuffer());
+  assert.equal(pdf.subarray(0, 5).toString(), '%PDF-');
+  // The whole point: geometry, not a pasted bitmap.
+  assert.ok(!/\/Subtype\s*\/Image/.test(pdf.toString('latin1')),
+    'PDF must not embed a raster image');
+  assert.ok(pdf.length > 1000, 'PDF looks suspiciously empty');
+  return undefined;
+});
+
+test('POST /api/export/pdf refuses an SVG with entity declarations', async (t) => {
+  if (!engineUp) return t.skip('Python engine not running');
+
+  const hostile = '<?xml version="1.0"?>'
+    + '<!DOCTYPE svg [<!ENTITY a "aaaa">]>'
+    + '<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">'
+    + '<path d="M0 0 L5 5 Z"/></svg>';
+
+  const res = await fetch(`${baseUrl}/api/export/pdf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'image/svg+xml' },
+    body: hostile,
+  });
+  assert.equal(res.status, 500);
+  const body = await res.json();
+  assert.equal(body.error.code, 'INVALID_SVG');
+  return undefined;
+});
+
 test('corrupt image data produces a clean 400, not a stack trace', async (t) => {
   if (!engineUp) return t.skip('Python engine not running');
 

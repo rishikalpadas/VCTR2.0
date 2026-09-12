@@ -166,4 +166,49 @@ async function vectorize({ filePath, detectedType, preset, options }) {
   return { svg: body.svg, meta: body.meta || {} };
 }
 
-module.exports = { checkHealth, listPresets, vectorize };
+/**
+ * Convert an already-generated SVG into a vector PDF.
+ *
+ * The SVG round-trips through the browser rather than being re-traced, so the
+ * PDF matches exactly what was previewed and costs milliseconds instead of
+ * repeating a multi-second trace. The engine re-validates it as untrusted
+ * input regardless of where it claims to have come from.
+ *
+ * @returns {Promise<Buffer>} the PDF bytes
+ */
+async function exportPdf(svg) {
+  const form = new FormData();
+  form.append('file', new Blob([svg], { type: 'image/svg+xml' }), 'artwork.svg');
+
+  const url = `${config.python.baseUrl}/export/pdf`;
+  const startedAt = Date.now();
+
+  const response = await fetchWithTimeout(
+    url,
+    { method: 'POST', body: form },
+    config.python.exportTimeoutMs,
+    'PDF export',
+  );
+
+  if (!response.ok) {
+    throw toApiError(response.status, await readJson(response, 'export/pdf'));
+  }
+
+  const buffer = Buffer.from(await response.arrayBuffer());
+
+  // The engine asserts this too; checking here as well means a misconfigured
+  // or swapped-out engine cannot quietly start returning something else.
+  if (!buffer.subarray(0, 5).equals(Buffer.from('%PDF-'))) {
+    throw ApiError.internal(
+      'The export service returned a file that is not a PDF.',
+      `unexpected magic bytes: ${buffer.subarray(0, 8).toString('hex')}`,
+    );
+  }
+
+  logger.info(
+    `<- engine pdf ok in ${Date.now() - startedAt}ms (${(buffer.length / 1024).toFixed(1)} KB)`,
+  );
+  return buffer;
+}
+
+module.exports = { checkHealth, listPresets, vectorize, exportPdf };

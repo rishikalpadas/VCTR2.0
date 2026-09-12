@@ -15,12 +15,13 @@ import time
 
 import uvicorn
 from fastapi import FastAPI, File, Form, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from config import settings
-from errors import ImageTooLargeError, VectorizationError
+from errors import ImageTooLargeError, InvalidSvgError, VectorizationError
 from logging_config import configure_logging, get_logger
 from presets import list_presets
+from svg_export import svg_to_pdf
 from schemas import (
     EngineListResponse,
     ErrorResponse,
@@ -149,6 +150,32 @@ async def vectorize(
 
     outcome = vectorize_bytes(data, preset_name=preset, overrides=overrides)
     return VectorizeResponse(svg=outcome.svg, meta=outcome.meta)
+
+
+@app.post(
+    "/export/pdf",
+    responses={
+        200: {"content": {"application/pdf": {}}},
+        400: {"model": ErrorResponse},
+        500: {"model": ErrorResponse},
+    },
+)
+async def export_pdf(file: UploadFile = File(..., description="SVG document")):
+    """Convert a generated SVG into a single-page vector PDF.
+
+    Takes the SVG rather than re-tracing the original raster: the export then
+    matches exactly what the user previewed, and costs milliseconds instead of
+    repeating a multi-second trace. The SVG arrives from the browser, so it is
+    validated as untrusted input - see ``svg_export._reject_unsafe``.
+    """
+    raw = await file.read()
+    try:
+        svg = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise InvalidSvgError("The SVG was not valid UTF-8 text.") from exc
+
+    pdf = svg_to_pdf(svg)
+    return Response(content=pdf, media_type="application/pdf")
 
 
 if __name__ == "__main__":

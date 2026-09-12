@@ -28,3 +28,10 @@ vtracer==0.6.15
 
 # --- SVG optimization ------------------------------------------------------
 scour==0.38.2
+
+# --- PDF export ------------------------------------------------------------
+# Pure-Python SVG -> vector PDF. Chosen over CairoSVG specifically because it
+# needs no native cairo DLLs, which are the usual cause of a failed Windows
+# install.
+svglib==2.2.0
+reportlab==5.0.1

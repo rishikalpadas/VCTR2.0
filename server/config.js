@@ -20,6 +20,8 @@ const config = {
     // comfortably above the worst realistic case or valid work gets killed.
     timeoutMs: toInt(process.env.PYTHON_TIMEOUT_MS, 120000),
     healthTimeoutMs: toInt(process.env.PYTHON_HEALTH_TIMEOUT_MS, 4000),
+    // Format conversion is pure geometry - no tracing - so it is fast.
+    exportTimeoutMs: toInt(process.env.PYTHON_EXPORT_TIMEOUT_MS, 30000),
   },
 
   upload: {
@@ -32,6 +34,12 @@ const config = {
     // Keep a copy of each generated SVG on disk. Off by default: the POC
     // returns the SVG inline and has no reason to retain user uploads.
     persistOutputs: process.env.PERSIST_OUTPUTS === 'true',
+  },
+
+  export: {
+    // Generated SVGs run 50-150 KB; this leaves generous headroom without
+    // letting a client post something that could exhaust the renderer.
+    maxSvgBytes: toInt(process.env.MAX_EXPORT_SVG_BYTES, 8 * 1024 * 1024),
   },
 
   frontendDir: path.join(__dirname, '..', 'frontend'),
