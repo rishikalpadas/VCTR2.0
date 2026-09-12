@@ -104,6 +104,22 @@
           </p>
         </div>
         <div class="field">
+          <label for="smoothInput">Edge smoothing</label>
+          <select id="smoothInput">
+            <option value="">Auto (recommended)</option>
+            <option value="0">Off - follow the pixels exactly</option>
+            <option value="0.5">Light</option>
+            <option value="0.7">Normal</option>
+            <option value="1.0">Strong</option>
+          </select>
+          <p class="field__help">
+            Cleans sub-pixel noise off colour-region boundaries before tracing,
+            so curves come out as curves instead of many short straight
+            segments. This is the main fix for jagged outlines on compressed
+            artwork. Turn it down if fine detail is being rounded away.
+          </p>
+        </div>
+        <div class="field">
           <label for="supersampleInput">Supersampling</label>
           <select id="supersampleInput">
             <option value="">Use the preset's default</option>

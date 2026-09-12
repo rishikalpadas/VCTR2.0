@@ -29,7 +29,7 @@
   var el = {};
   ['dropZone', 'browseBtn', 'fileInput', 'fileMeta', 'thumbPreview', 'fileName',
     'fileSize', 'fileDims', 'fileType', 'clearBtn', 'presetSelect', 'presetHelp',
-    'backgroundSelect', 'enclosedCheck', 'maxDimInput', 'supersampleInput',
+    'backgroundSelect', 'enclosedCheck', 'maxDimInput', 'supersampleInput', 'smoothInput',
     'vectorizeBtn', 'progress',
     'progressDetail', 'errorBox', 'errorTitle', 'errorMessage', 'errorCode',
     'warningBox', 'warningList', 'resultPanel', 'originalPreview', 'svgPreview',
@@ -194,6 +194,9 @@
     }
     if (el.supersampleInput.value) {
       form.append('supersample', el.supersampleInput.value);
+    }
+    if (el.smoothInput.value !== '') {
+      form.append('boundary_smooth_sigma', el.smoothInput.value);
     }
     return form;
   }

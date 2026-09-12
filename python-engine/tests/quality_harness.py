@@ -33,23 +33,28 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from vectorizer import vectorize_bytes  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from pathstats import summarise  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[2]
 SAMPLES = ROOT / "samples"
 OUT_HTML = ROOT / "frontend" / "_quality.html"
 
 # (label, input file, reference file, preset, overrides)
 DEFAULT_RUNS = [
-    # Exact before/after. "BEFORE" reproduces the reported configuration:
-    # 2 significant digits, no supersampling, no JPEG cleanup.
-    ("BEFORE (as reported)", "logo_repro.jpg", "logo_repro.png", "flat_art",
-     {"supersample": 1.0, "jpeg_cleanup": False, "significant_digits": 2}),
-    ("AFTER: precision fix only", "logo_repro.jpg", "logo_repro.png", "flat_art",
-     {"supersample": 1.0, "jpeg_cleanup": False}),
-    ("AFTER: + jpeg cleanup", "logo_repro.jpg", "logo_repro.png", "flat_art",
-     {"supersample": 1.0}),
-    ("AFTER: full (auto)", "logo_repro.jpg", "logo_repro.png", "auto", None),
-    ("AFTER: full, lossless png", "logo_repro.png", "logo_repro.png", "auto", None),
-    ("AFTER: detailed", "logo_repro.jpg", "logo_repro.png", "detailed", None),
+    ("badge BEFORE (first report)", "badge_repro.jpg", "badge_repro.png", "logo",
+     {"boundary_smooth_sigma": 0.0, "corner_threshold": 40, "length_threshold": 4.0,
+      "background_edge_bleed": 0}),
+    ("badge AFTER", "badge_repro.jpg", "badge_repro.png", "auto", None),
+    ("serif BEFORE (first report)", "logo_repro.jpg", "logo_repro.png", "logo",
+     {"boundary_smooth_sigma": 0.0, "corner_threshold": 40, "length_threshold": 4.0,
+      "background_edge_bleed": 0}),
+    ("serif AFTER", "logo_repro.jpg", "logo_repro.png", "auto", None),
+    ("flat_art sample", "sample_flat_art.png", "sample_flat_art.png", "flat_art",
+     {"background": "never"}),
+    ("typography sample", "sample_typography.png", "sample_typography.png",
+     "typography", {"background": "never"}),
+    ("line_art sample", "sample_line_art.png", "sample_line_art.png", "line_art", None),
 ]
 
 
@@ -75,16 +80,16 @@ def run_case(label, source, reference, preset, overrides) -> dict:
         source_path.read_bytes(), preset_name=preset, overrides=overrides
     )
     meta = outcome.meta
+    seg = summarise(outcome.svg)
     print(
         f"{label:28s} preset={meta['preset_used']:10s} "
         f"paths={meta['path_count']:5d} {meta['svg_bytes'] / 1024:7.1f}KB "
         f"{meta['processing_ms']:6.0f}ms "
-        f"ss={meta['supersample']} "
-        f"bg={meta['background']['applied']}"
-        f"({meta['background'].get('removed_ratio', 0):.0%},tol={meta['background'].get('tolerance','-')})"
+        f"ss={meta['supersample']} lines={seg['line_share']:.0%} "
+        f"seg={seg['segments']}"
     )
     return {
-        "label": label,
+        "label": f"{label} [{seg['line_share']:.0%} lines]",
         "preset": meta["preset_used"],
         "paths": meta["path_count"],
         "bytes": meta["svg_bytes"],

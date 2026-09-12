@@ -32,6 +32,7 @@ server/outputs/*
 # Generated test fixtures (recreate with: npm run samples)
 samples/sample_*
 samples/logo_repro.*
+samples/badge_repro.*
 samples/out/
 
 # Quality-harness scratch output (see python-engine/tests/quality_harness.py)

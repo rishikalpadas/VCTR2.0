@@ -97,6 +97,17 @@ def remove_background(
 
     report["enclosed_removed_ratio"] = round(enclosed_ratio, 4)
 
+    # Eat the anti-aliasing ramp the flood fill could not cross. Without this
+    # the leftover half-blended band becomes its own ragged traced layer.
+    if params.background_edge_bleed > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask = cv2.dilate(
+            mask.astype(np.uint8), kernel, iterations=params.background_edge_bleed
+        ).astype(bool)
+        removed_ratio = float(mask.mean())
+        report["removed_ratio"] = round(removed_ratio, 4)
+        report["edge_bleed_px"] = params.background_edge_bleed
+
     result = rgba.copy()
     # Clear colour as well as alpha, so the tracer never sees a halo of the old
     # background colour bleeding out of anti-aliased edges.

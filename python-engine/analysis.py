@@ -67,6 +67,12 @@ class ImageAnalysis:
     is_grayscale: bool
     colorfulness: float
     edge_density: float
+    # Share of edge energy lying within +-10 degrees of horizontal or vertical.
+    # High = rectilinear artwork (frames, rules, slab serifs), low =
+    # curve-dominant artwork (rings, script, organic shapes). Reported as a
+    # diagnostic only. It briefly gated boundary smoothing; see the note in
+    # preprocessing.preprocess for why that was wrong.
+    axis_aligned_edge_share: float
     # Border statistics drive background removal.
     border_color: tuple[int, int, int]
     border_uniformity: float
@@ -129,6 +135,42 @@ def _border_stats(rgb: np.ndarray) -> tuple[tuple[int, int, int], float]:
     distance = np.abs(border.astype(np.int16) - modal_color.astype(np.int16)).max(axis=1)
     uniformity = float((distance <= 20).mean())
     return tuple(int(c) for c in modal_color), uniformity
+
+
+def _axis_aligned_share(gray: np.ndarray) -> float:
+    """Fraction of edge energy running horizontally or vertically.
+
+    Weighted histogram of gradient orientations over 0-180 degrees. Artwork
+    built from frames, baselines and slab serifs piles up near 0 and 90; rings,
+    script and organic shapes spread evenly. Measured: a circular badge lands
+    around 0.35, loose line art around 0.09, a rectilinear emblem around 0.48,
+    blocky lettering around 0.54.
+
+    Diagnostic only. It briefly scaled boundary smoothing down on
+    corner-dominated artwork, based on a measurement that later fixes
+    invalidated - see the note in preprocessing._quantize.
+    """
+    gradient_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gradient_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    magnitude = np.hypot(gradient_x, gradient_y)
+
+    if magnitude.size == 0:
+        return 0.5
+    threshold = max(40.0, float(np.percentile(magnitude, 97)))
+    strong = magnitude > threshold
+    if strong.sum() < 50:
+        return 0.5
+
+    angles = np.degrees(np.arctan2(gradient_y[strong], gradient_x[strong])) % 180.0
+    histogram, _ = np.histogram(
+        angles, bins=36, range=(0, 180), weights=magnitude[strong]
+    )
+    total = histogram.sum()
+    if total <= 0:
+        return 0.5
+    shares = histogram / total
+    # Bins 0,1 and 35 straddle 0/180 deg; bins 17,18,19 straddle 90 deg.
+    return float(shares[[0, 1, 17, 18, 19, 35]].sum())
 
 
 def _nearest_significant_distance(
@@ -206,6 +248,7 @@ def analyze(rgba: np.ndarray) -> ImageAnalysis:
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     edges = cv2.Canny(gray, 80, 180)
     edge_density = float((edges > 0).mean())
+    axis_aligned_edge_share = _axis_aligned_share(gray)
 
     border_color, border_uniformity = _border_stats(rgb)
     background_is_flat = bool(border_uniformity >= 0.85)
@@ -237,6 +280,7 @@ def analyze(rgba: np.ndarray) -> ImageAnalysis:
         is_grayscale=is_grayscale,
         colorfulness=round(colorfulness, 2),
         edge_density=round(edge_density, 4),
+        axis_aligned_edge_share=round(axis_aligned_edge_share, 4),
         border_color=border_color,
         border_uniformity=round(border_uniformity, 4),
         background_is_flat=background_is_flat,

@@ -96,6 +96,19 @@ class PreprocessParams:
     # Flood-fill colour tolerance, per channel, when removing a background.
     background_tolerance: int = 18
 
+    # Extra pixels of background eaten past where the flood fill stopped.
+    #
+    # The boundary between artwork and canvas is an anti-aliasing ramp, not a
+    # step. A tolerance tight enough to avoid leaking into the artwork stops
+    # partway up that ramp, leaving a 1-2px band of half-blended pixels behind.
+    # Alpha hardening then makes that band fully opaque, and the tracer renders
+    # it as a separate, ragged, intermediate-coloured layer hugging every
+    # shape - the most common cause of "the outline looks frayed".
+    #
+    # One pixel of dilation consumes the ramp. Raise it if you still see a
+    # fringe; lower it to 0 to keep every last pixel of artwork edge.
+    background_edge_bleed: int = 1
+
     # Also knock out *enclosed* regions that match the background colour -
     # the counters inside B, O, e, and gaps inside a wreath or frame.
     #
@@ -124,6 +137,25 @@ class PreprocessParams:
     quantize_colors: int | Literal["auto"] | None = None
     quantize_min_k: int = 4
     quantize_max_k: int = 24
+
+    # Majority-vote smoothing of the quantized colour regions, in OUTPUT
+    # pixels (scaled internally by the supersample factor).
+    #
+    # This is what makes curves come out as curves. Quantization produces a
+    # hard region boundary that still carries every wobble from the source
+    # pixels - JPEG ringing, anti-aliasing, the odd stray pixel. A tracer reads
+    # each wobble as a corner and joins them with straight segments, so a
+    # perfectly circular ring comes back as a polygon: measured at 52% straight
+    # line segments on a badge design made entirely of circles.
+    #
+    # Smoothing the region membership (not the colours) removes sub-pixel
+    # boundary noise before the tracer ever sees it. On that badge it took line
+    # segments from 52% to 3% and halved the file, at identical pixel fidelity.
+    #
+    # Only applies when quantization is on - it operates on the cluster labels.
+    # Too much rounds off genuine corners: 0.9 is safe, past ~1.2 letterforms
+    # start to soften.
+    boundary_smooth_sigma: float = 0.0
 
     # Force the image to pure black/white before tracing (line art).
     binarize: bool = False
@@ -195,7 +227,7 @@ PRESETS: dict[str, Preset] = {
             filter_speckle=4,
             color_precision=6,
             layer_difference=16,
-            corner_threshold=60,
+            corner_threshold=70,
             path_precision=3,
         ),
     ),
@@ -217,6 +249,7 @@ PRESETS: dict[str, Preset] = {
             jpeg_cleanup=True,
             quantize_colors="auto",
             quantize_max_k=10,
+            boundary_smooth_sigma=0.7,
         ),
         engine_params=VTracerParams(
             filter_speckle=4,
@@ -224,8 +257,13 @@ PRESETS: dict[str, Preset] = {
             # Finer than flat_art (24): the grey steps inside an illustration
             # are what get merged away at coarse layer differences.
             layer_difference=12,
-            corner_threshold=40,
-            length_threshold=4.0,
+            # High on purpose, and the opposite of the intuition that "lower =
+            # sharper corners". A low threshold makes the tracer classify
+            # boundary noise as corners and join them with straight segments;
+            # measured, dropping from 70 to 40 cost 1.9 RMSE and turned half
+            # the segments of a circular badge into polylines.
+            corner_threshold=70,
+            length_threshold=4.5,
             splice_threshold=45,
             path_precision=3,
         ),
@@ -245,12 +283,13 @@ PRESETS: dict[str, Preset] = {
             bilateral_diameter=5,
             quantize_colors="auto",
             quantize_max_k=12,
+            boundary_smooth_sigma=0.7,
         ),
         engine_params=VTracerParams(
             filter_speckle=8,
             color_precision=8,
             layer_difference=24,
-            corner_threshold=60,
+            corner_threshold=70,
             length_threshold=4.5,
             path_precision=3,
         ),
@@ -269,12 +308,19 @@ PRESETS: dict[str, Preset] = {
             bilateral_diameter=0,  # never soften letterform edges
             quantize_colors="auto",
             quantize_max_k=10,
+            # Lighter than logo/flat_art: serif brackets and spurs are only a
+            # couple of pixels across. In practice the adaptive safety factor
+            # usually zeroes this for real lettering anyway.
+            boundary_smooth_sigma=0.5,
         ),
         engine_params=VTracerParams(
             filter_speckle=6,
             color_precision=8,
             layer_difference=22,
-            corner_threshold=38,  # sharper corner detection for serifs
+            # Not lower than the others: see the logo preset. Serif corners are
+            # preserved by withholding smoothing (the adaptive safety factor
+            # zeroes it for rectilinear type), not by hunting for corners.
+            corner_threshold=60,
             length_threshold=4.0,
             splice_threshold=45,
             path_precision=3,
@@ -409,8 +455,10 @@ _PRE_OVERRIDES = {
     "supersample": lambda v: float(min(3.0, max(1.0, float(v)))),
     "background": str,
     "background_tolerance": int,
+    "background_edge_bleed": int,
     "remove_enclosed_background": bool,
     "jpeg_cleanup": bool,
+    "boundary_smooth_sigma": lambda v: float(min(3.0, max(0.0, float(v)))),
     "quantize_colors": _cast_quantize,
 }
 
@@ -425,6 +473,8 @@ _ENGINE_OVERRIDES = {
     "color_precision": int,
     "layer_difference": int,
     "corner_threshold": int,
+    "length_threshold": float,
+    "splice_threshold": int,
     "path_precision": int,
     "mode": str,
 }

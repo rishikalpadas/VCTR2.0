@@ -105,9 +105,11 @@ image-to-vector-poc/
 │   │   ├── photo_extractor.py  V2 garment-photo pipeline (stubbed, documented)
 │   │   └── future_engines.py   StarVector / Adobe placeholders
 │   ├── tests/
-│   │   ├── test_pipeline.py    32 tests incl. precision + background regressions
+│   │   ├── test_pipeline.py    41 tests incl. precision, curve + background regressions
 │   │   ├── make_samples.py     synthetic fixtures
-│   │   ├── make_logo_repro.py  dark-field logo repro case
+│   │   ├── make_logo_repro.py  dark-field serif emblem repro
+│   │   ├── make_badge_repro.py circular badge repro (curve quality)
+│   │   ├── pathstats.py        real segment counts (curve vs line)
 │   │   └── quality_harness.py  scores output against a lossless reference
 │   └── requirements.txt
 │
@@ -145,7 +147,9 @@ Node API itself is healthy, and the frontend uses this to drive the badge.
 | `background` | no | `auto`, `always`, `never` |
 | `remove_enclosed_background` | no | `true` to knock out letter counters |
 | `max_dimension` | no | working resolution of the artwork |
-| `supersample` | no | `1`–`3`. Trace at this multiple of the working resolution, then scale back via the viewBox. The main lever on edge smoothness. |
+| `supersample` | no | `1`–`3`. Trace at this multiple of the working resolution, then scale back via the viewBox. |
+| `boundary_smooth_sigma` | no | `0`–`3` (output pixels, scaled by the supersample factor). Smooths sub-pixel noise off colour-region boundaries before tracing. `0` disables; under ~0.4 is a no-op. |
+| `background_edge_bleed` | no | Pixels of background eaten past the flood fill, to consume the anti-aliasing ramp. Default `1`; `0` keeps every pixel of artwork edge. |
 
 Success:
 
@@ -332,7 +336,7 @@ the GPU and credential constraints each brings.
 
 ## 9. Testing
 
-### Python (32 tests)
+### Python (41 tests)
 
 ```bat
 cd python-engine
@@ -475,62 +479,134 @@ lossless reference with `tests/quality_harness.py`:
 
 4.4x less error overall. Two thirds of it was one line of configuration.
 
+A second reported case - a circular "Be happy" badge - was smooth in pixel
+terms but came back as visible polygons. Same harness, adding boundary
+smoothing and correcting `corner_threshold`:
+
+| Change | RMSE | Edge RMSE | straight segments |
+|---|---|---|---|
+| As reported | 8.00 | 20.50 | 43% |
+| + boundary smoothing, `corner_threshold` 40 -> 70, edge bleed | **6.84** | **17.69** | **3%** |
+
+Segment count 4003 -> 2029, on artwork made entirely of circles where every
+straight segment was an artifact. The rectilinear emblem improved at the same
+time: RMSE 10.12 -> 8.32, 70 paths -> 37, 72.8 KB -> 50.4 KB.
+
 ### The bugs behind it
 
 1. **The optimizer was destroying the geometry it optimized.** scour's
    precision option counts **significant digits**, not decimal places. It was
    set to 2. On a 1017px canvas that rounds every number in the file to two
-   significant figures: the root `width` became `1e3` — literally 1000, a 17px
-   error — and every Bezier control point was snapped to the integer pixel
+   significant figures: the root `width` became `1e3` - literally 1000, a 17px
+   error - and every Bezier control point was snapped to the integer pixel
    grid. VTracer was emitting good curves and the cleanup stage was quantizing
-   them into a staircase. This is the jaggedness. Now 5 significant digits
-   (scour's own default); `OptimizeParams.significant_digits` documents the
-   trap. Regression tests: `TestCoordinatePrecision`.
+   them into a staircase. Now 5 significant digits (scour's own default);
+   `OptimizeParams.significant_digits` documents the trap. Regression tests:
+   `TestCoordinatePrecision`.
 
-2. **Quantization was spending its colour budget on compression noise.** `k`
+2. **Region boundaries were traced with their noise intact.** Quantization
+   produces a hard boundary that still carries every wobble from the source
+   pixels - JPEG ringing, anti-aliasing, stray pixels. The tracer reads each
+   wobble as a corner and joins them with straight segments, so a badge made
+   entirely of circles came back with 43% of its segments as straight lines.
+   `boundary_smooth_sigma` now smooths *cluster membership* before tracing -
+   a majority vote per pixel over each cluster's blurred mask, so no new
+   colours can appear. On that badge: 43% straight segments down to 3%,
+   segment count 4003 -> 1703, file 80 KB -> 60 KB, and RMSE slightly better
+   (8.00 -> 7.19). Regression tests: `TestCurveQuality`.
+
+3. **`corner_threshold` was backwards.** It was set to 40 on the reasoning that
+   "lower = sharper corners". The opposite is true: a low threshold makes the
+   tracer classify boundary noise as corners and connect them with lines.
+   Raising it to 70 improved *both* test emblems - the rectilinear one went
+   from RMSE 10.12 to 8.19 with no other change.
+
+4. **A safety gate built on a stale measurement, then removed.** Smoothing
+   initially measured as helping curved artwork (RMSE 8.2 -> 6.9) and wrecking
+   rectilinear artwork (8.2 -> 12.0), so it was scaled down by
+   `analysis.axis_aligned_edge_share`. That measurement was taken *before*
+   `corner_threshold` was corrected and edge bleed was added, and those two
+   changes invalidated it. The gate survived them, and on a real badge - which
+   measures 0.42 because of its border frame and chunky letter stems - it was
+   delivering 0.68 of an intended 1.40 sigma, halving the fix on exactly the
+   artwork that needed it. Re-measured on the current pipeline, smoothing helps
+   both: 8.15 -> 6.84 curved, 9.42 -> 8.32 rectilinear. Gate removed; the
+   metric is still reported as a diagnostic. The lesson is cheap to state and
+   easy to repeat: a heuristic calibrated against one configuration has to be
+   re-validated whenever that configuration changes.
+
+5. **Quantization was spending its colour budget on compression noise.** `k`
    was derived from `unique_colors`, which counts every JPEG ringing artifact
-   and anti-aliasing step as a distinct colour — a six-colour logo reported 437
-   and got `k=11`. The surplus clusters land on the halos hugging every
-   high-contrast edge, turning each into its own thin sliver path. `k` now
-   comes from `analysis.significant_colors` (buckets covering >=0.4% of the
-   image), which reports 9 for the same file.
+   as a colour - a six-colour logo reported 437 and got `k=11`. The surplus
+   clusters land on the halos hugging high-contrast edges, turning each into
+   its own thin sliver path. `k` now comes from
+   `analysis.significant_colors` (buckets covering >=0.4% of the image).
 
-3. **The background flood fill ate dark artwork on a dark field.** A fixed
+6. **The background flood fill ate dark artwork on a dark field.** A fixed
    tolerance of 18 is wider than the gap between a near-black illustration
    (28,27,24) and a near-black canvas (43,41,39), so the fill walked across the
-   anti-aliased boundary and erased the artwork. `analysis.border_color_margin`
-   now measures the distance to the nearest significant non-background colour
-   and the tolerance is clamped to half of it — 18 -> 7 on that logo, and
-   removal drops from 86% of the canvas to 77%. Regression tests:
+   anti-aliased boundary. `analysis.border_color_margin` now measures the
+   distance to the nearest significant non-background colour and the tolerance
+   is clamped to half of it - 18 -> 7 on that logo. Regression tests:
    `TestBackgroundSafety`.
 
-4. **Supersampling needs its engine parameters scaled with it.** Tracing at 2x
+7. **Supersampling needs its engine parameters scaled with it.** Tracing at 2x
    without touching VTracer's thresholds makes `filter_speckle` (an *area*)
    suppress a quarter of what it should and doubles the node count for no gain.
    `presets.scale_engine_params` scales areas by the square of the factor and
-   lengths linearly. Until the precision bug above was fixed, supersampling
-   appeared to make output *worse* — at 2x the viewBox `2034` was being
-   mangled to `2e3`, a 1.7% scale error that outweighed the smoothing.
+   lengths linearly. Until bug 1 was fixed, supersampling appeared to make
+   output *worse* - at 2x the viewBox `2034` was being mangled to `2e3`.
 
-5. **Line-art preset traced one canvas-sized black rectangle.** VTracer's
+8. **Line-art preset traced one canvas-sized black rectangle.** VTracer's
    `colormode="binary"` thresholds on *luminance* and ignores alpha. Feeding it
    black ink on a transparent canvas reads as an all-black image. Binarization
-   must output black-on-**white** and fully opaque; the tracer then emits only
-   the dark shapes, and the SVG background is transparent because nothing was
-   drawn there.
+   must output black-on-**white** and fully opaque.
 
-6. **Every SVG was malformed** (first build). Setting `xmlns` manually on a
+9. **Every SVG was malformed** (first build). Setting `xmlns` manually on a
    root element already in the SVG namespace makes ElementTree emit the
    declaration twice: `duplicate attribute`, unparseable document.
 
-7. **Rejected uploads leaked onto disk.** Cleanup lived in the controller's
-   `finally`, but a multer or magic-byte rejection short-circuits to the error
-   handler and the controller never runs. Now registered on
-   `res.once('close')`, which fires on success, error and client abort alike.
+10. **Rejected uploads leaked onto disk.** Cleanup lived in the controller's
+    `finally`, but a multer or magic-byte rejection short-circuits to the error
+    handler and the controller never runs. Now registered on
+    `res.once('close')`, which fires on success, error and client abort alike.
 
-8. **`quantize_colors: null` could not turn quantization off.** `apply_overrides`
-   skipped any `None` value as "not supplied", so the option silently did
-   nothing. Explicit nulls are now distinguished from absent keys.
+11. **`quantize_colors: null` could not turn quantization off.**
+    `apply_overrides` skipped any `None` value as "not supplied".
+
+12. **Background removal left a ragged fringe.** The artwork/canvas boundary is
+    an anti-aliasing ramp, not a step. A fill tolerance tight enough to avoid
+    leaking into the artwork (bug 6) stops partway up that ramp, and alpha
+    hardening then makes the leftover half-blended band fully opaque - so the
+    tracer renders it as a separate ragged intermediate-coloured layer hugging
+    every shape. `background_edge_bleed` dilates the mask by 1px to consume the
+    ramp: on the rectilinear emblem that removed 29 fringe paths and 26 KB.
+    It is an honest trade, not a free win - eating a pixel of edge costs about
+    1 RMSE, so set it to `0` if you would rather keep the fringe than thin the
+    strokes.
+
+13. **The pipeline was not deterministic.** `cv2.kmeans` seeds k-means++ from
+    OpenCV's own global RNG, which numpy seeding does not touch, so the same
+    image produced different cluster centres - and a different SVG - on every
+    run. `cv2.setRNGSeed(0)` plus a stable ordering of the centres fixes it.
+    This was also quietly making the quality comparisons above unreliable.
+    Regression test: `TestDeterminism`.
+
+### A note on the line-share metric
+
+`tests/pathstats.py` reports the share of path segments that are straight
+lines, and it is the clearest signal for "a circle came back as a polygon".
+Two caveats, both learned by getting them wrong:
+
+* **Count segments, not command letters.** SVG allows implicit command
+  repetition (`c1,2 3,4 5,6 …` is three curves under one `c`), and scour uses
+  it heavily. Counting letters undercounts curves badly - it read 71% lines on
+  a file that actually has 50%.
+* **It is a proxy, not ground truth.** scour legitimately rewrites a Bezier
+  whose control points are collinear as a line, and that is visually
+  identical. On a lossless source with no boundary noise, smoothing can even
+  *raise* the line share while changing nothing visible. Trust RMSE for
+  quality; use line share to explain *why*.
 
 ### Measuring quality changes
 

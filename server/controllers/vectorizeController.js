@@ -22,7 +22,7 @@ const VALID_PRESETS = new Set([
 
 const BOOLEAN_OPTIONS = ['remove_enclosed_background'];
 const NUMBER_OPTIONS = ['max_dimension', 'background_tolerance', 'filter_speckle', 'color_precision'];
-const FLOAT_OPTIONS = ['supersample'];
+const FLOAT_OPTIONS = ['supersample', 'boundary_smooth_sigma'];
 const STRING_OPTIONS = ['background'];
 const VALID_BACKGROUND_MODES = new Set(['auto', 'always', 'never']);
 

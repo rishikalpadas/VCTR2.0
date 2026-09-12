@@ -14,8 +14,10 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# Make the service modules importable when running from tests/.
+# Make the service modules importable when running from tests/, and this
+# directory importable when unittest discovers with a different top level.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
@@ -26,6 +28,7 @@ from errors import (  # noqa: E402
     UnknownPresetError,
     UnsupportedFormatError,
 )
+import pathstats  # noqa: E402
 from presets import get_preset  # noqa: E402
 from svg_optimizer import validate_svg  # noqa: E402
 from vectorizer import vectorize_bytes  # noqa: E402
@@ -301,6 +304,190 @@ class TestSupersampling(unittest.TestCase):
             overrides={"supersample": 1.0},
         )
         self.assertEqual(outcome.meta["supersample"], 1.0)
+
+
+class TestCurveQuality(unittest.TestCase):
+    """Regression: circles were coming back as polygons.
+
+    A design made of rings was traced with 43-52% of its segments as straight
+    lines. Two causes: no smoothing of the quantized region boundary, so every
+    sub-pixel wobble read as a corner; and `corner_threshold=40`, which is far
+    too eager to declare one.
+    """
+
+    @staticmethod
+    def rings(size: int = 700) -> Image.Image:
+        """Concentric rings: zero real corners anywhere in the artwork."""
+        image = Image.new("RGB", (size, size), (204, 204, 253))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((40, 40, size - 40, size - 40), outline=(45, 42, 50), width=9)
+        draw.ellipse((90, 90, size - 90, size - 90), outline=(45, 42, 50), width=9)
+        draw.ellipse((210, 210, size - 210, size - 210), fill=(45, 42, 50))
+        return image
+
+    @classmethod
+    def noisy_rings(cls) -> bytes:
+        """The same rings as JPEG.
+
+        Compression noise is the actual failure condition - on a lossless
+        source there is no boundary jitter for smoothing to remove, so the
+        regression only reproduces here.
+        """
+        buffer = io.BytesIO()
+        cls.rings().save(buffer, format="JPEG", quality=82, subsampling=2)
+        return buffer.getvalue()
+
+    @staticmethod
+    def line_share(svg: str) -> float:
+        """Share of path segments that are straight lines.
+
+        A proxy, not ground truth: scour legitimately rewrites a Bezier whose
+        control points are collinear as a line, and that is visually identical.
+        It is still the clearest signal available for "a circle came back as a
+        polygon", which is why it is compared *relatively* below rather than
+        against a fixed budget.
+        """
+        return pathstats.summarise(svg)["line_share"]
+
+    def test_smoothing_reduces_polyline_output_on_noisy_curves(self):
+        data = self.noisy_rings()
+        smoothed = vectorize_bytes(data, preset_name="logo")
+        raw = vectorize_bytes(
+            data, preset_name="logo", overrides={"boundary_smooth_sigma": 0.0}
+        )
+        self.assertLess(
+            self.line_share(smoothed.svg),
+            self.line_share(raw.svg),
+            f"smoothing did not reduce straight segments: "
+            f"{self.line_share(smoothed.svg):.0%} vs "
+            f"{self.line_share(raw.svg):.0%}",
+        )
+
+    def test_smoothing_reduces_segment_count_on_noisy_curves(self):
+        """Fewer nodes for the same shape - the file gets simpler, not just smaller."""
+        data = self.noisy_rings()
+        smoothed = pathstats.summarise(
+            vectorize_bytes(data, preset_name="logo").svg
+        )
+        raw = pathstats.summarise(
+            vectorize_bytes(
+                data, preset_name="logo", overrides={"boundary_smooth_sigma": 0.0}
+            ).svg
+        )
+        self.assertLess(smoothed["segments"], raw["segments"])
+
+    def test_smoothing_is_reported(self):
+        outcome = vectorize_bytes(self.noisy_rings(), preset_name="logo")
+        steps = " ".join(outcome.meta["preprocess_steps"])
+        self.assertIn("boundary_smooth", steps)
+
+    def test_smoothing_can_be_disabled(self):
+        outcome = vectorize_bytes(
+            self.noisy_rings(),
+            preset_name="logo",
+            overrides={"boundary_smooth_sigma": 0.0},
+        )
+        steps = " ".join(outcome.meta["preprocess_steps"])
+        self.assertNotIn("boundary_smooth", steps)
+
+    @staticmethod
+    def _fill_count(svg: str) -> int:
+        return len(set(re.findall(r'fill="(#[0-9A-Fa-f]{3,6})"', svg)))
+
+    def test_smoothing_does_not_expand_the_palette(self):
+        """Smoothing votes on cluster membership, so it cannot invent colours.
+
+        Note the output palette is still larger than k: VTracer's `stacked`
+        hierarchy emits its own intermediate blend layers between colour
+        regions regardless of how few colours the input had. What matters is
+        that smoothing does not *add* to that - it should reduce it, by
+        removing the noisy boundary pixels those layers were tracing.
+        """
+        data = self.noisy_rings()
+        smoothed = vectorize_bytes(
+            data, preset_name="logo", overrides={"quantize_colors": 4}
+        )
+        raw = vectorize_bytes(
+            data,
+            preset_name="logo",
+            overrides={"quantize_colors": 4, "boundary_smooth_sigma": 0.0},
+        )
+        self.assertLessEqual(
+            self._fill_count(smoothed.svg), self._fill_count(raw.svg)
+        )
+
+
+class TestDeterminism(unittest.TestCase):
+    """The same image must always produce the same SVG.
+
+    Regression: `cv2.kmeans` seeds k-means++ from OpenCV's own global RNG,
+    which numpy's seeding does not touch. Cluster centres therefore differed
+    between runs, so re-exporting the same artwork gave a different file - and
+    quality tests comparing two runs were quietly flaky.
+    """
+
+    def test_repeated_runs_are_byte_identical(self):
+        data = TestCurveQuality.noisy_rings()
+        first = vectorize_bytes(data, preset_name="logo").svg
+        for attempt in range(3):
+            with self.subTest(attempt=attempt):
+                self.assertEqual(vectorize_bytes(data, preset_name="logo").svg, first)
+
+
+class TestSmoothingIsNotGated(unittest.TestCase):
+    """Regression: smoothing used to be scaled down by an axis-alignment gate.
+
+    The gate came from a measurement that two later fixes invalidated, and it
+    was halving the smoothing on exactly the artwork that needed it - a real
+    badge measured 0.42 axis-aligned share and received 0.68 of an intended
+    1.40 sigma. Re-measured on the current pipeline, smoothing improves curved
+    and rectilinear artwork alike, so the requested sigma is now honoured.
+    """
+
+    @staticmethod
+    def rectilinear(size: int = 700) -> Image.Image:
+        image = Image.new("RGB", (size, size), (245, 243, 235))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((60, 60, size - 60, 200), fill=(40, 40, 48))
+        draw.rectangle((60, 260, 380, 620), fill=(200, 60, 60))
+        draw.rectangle((430, 260, size - 60, 430), fill=(60, 110, 190))
+        draw.rectangle((430, 470, size - 60, 620), fill=(230, 190, 60))
+        return image
+
+    @staticmethod
+    def applied_sigma(outcome) -> float:
+        for step in outcome.meta["preprocess_steps"]:
+            if step.startswith("boundary_smooth"):
+                return float(step.split("=")[1].rstrip(")"))
+        return 0.0
+
+    def test_requested_sigma_is_applied_to_curved_artwork(self):
+        outcome = vectorize_bytes(
+            TestCurveQuality.noisy_rings(),
+            preset_name="logo",
+            overrides={"boundary_smooth_sigma": 0.7},
+        )
+        # 0.7 output pixels at 2x supersampling.
+        self.assertAlmostEqual(self.applied_sigma(outcome), 1.4, places=2)
+
+    def test_requested_sigma_is_applied_to_rectilinear_artwork_too(self):
+        buffer = io.BytesIO()
+        self.rectilinear().save(buffer, format="JPEG", quality=85)
+        outcome = vectorize_bytes(
+            buffer.getvalue(),
+            preset_name="logo",
+            overrides={"boundary_smooth_sigma": 0.7},
+        )
+        self.assertAlmostEqual(self.applied_sigma(outcome), 1.4, places=2)
+
+    def test_ineffective_sigmas_are_treated_as_off(self):
+        """A sigma too small to flip any vote should not cost a blur pass."""
+        outcome = vectorize_bytes(
+            TestCurveQuality.noisy_rings(),
+            preset_name="logo",
+            overrides={"boundary_smooth_sigma": 0.2},  # 0.4 applied
+        )
+        self.assertEqual(self.applied_sigma(outcome), 0.0)
 
 
 class TestOverrides(unittest.TestCase):

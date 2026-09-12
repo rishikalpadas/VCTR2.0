@@ -98,8 +98,10 @@ def preprocess(
     working, supersample = _supersample(working, params, steps)
 
     if params.quantize_colors is not None:
-        working, used_k = _quantize(working, params, analysis)
+        working, used_k, smoothed = _quantize(working, params, analysis, supersample)
         steps.append(f"quantize(k={used_k})")
+        if smoothed:
+            steps.append(f"boundary_smooth(sigma={smoothed:.2g})")
 
     if params.binarize:
         working = _binarize(working, params)
@@ -273,13 +275,56 @@ _KMEANS_FIT_SAMPLES = 150_000
 _ASSIGN_CHUNK = 400_000
 
 
+# Gaussian sigmas below this do nothing useful: the majority vote almost never
+# flips, because a 3x3 kernel at sigma 0.5 still leaves ~60% of the weight on
+# the centre pixel. Measured: sigma 0.5 produced byte-identical output to no
+# smoothing at all. Anything under the bar is treated as "off" rather than
+# silently costing a blur pass per cluster for no effect.
+_MIN_EFFECTIVE_SIGMA = 0.8
+
+
+def _smooth_labels(
+    labels: np.ndarray, cluster_count: int, sigma: float
+) -> np.ndarray:
+    """Majority-vote smoothing of a cluster-label map.
+
+    Blur each cluster's binary membership mask and take the winner per pixel.
+    Because the vote is over membership rather than colour, no new colours can
+    appear - the output is still exactly the k cluster centres - while the
+    boundary between regions loses its sub-pixel jitter.
+
+    A plain blur of the *image* would not work: it would create intermediate
+    colours along every boundary, which the tracer would then turn into extra
+    sliver layers. Median-filtering the labels would be worse still, since
+    label ids are nominal and their median is meaningless.
+    """
+    kernel = int(sigma * 6) | 1  # odd, ~3 sigma each side
+    height, width = labels.shape
+    best = np.full((height, width), -1.0, dtype=np.float32)
+    winner = np.zeros((height, width), dtype=np.int32)
+
+    for index in range(cluster_count):
+        mask = (labels == index).astype(np.float32)
+        blurred = cv2.GaussianBlur(mask, (kernel, kernel), sigma)
+        improved = blurred > best
+        best[improved] = blurred[improved]
+        winner[improved] = index
+
+    return winner
+
+
 def _quantize(
-    rgba: np.ndarray, params: PreprocessParams, analysis: ImageAnalysis
-) -> tuple[np.ndarray, int]:
+    rgba: np.ndarray,
+    params: PreprocessParams,
+    analysis: ImageAnalysis,
+    supersample: float = 1.0,
+) -> tuple[np.ndarray, int, float]:
     """k-means colour quantization over the visible pixels only.
 
     Transparent pixels are excluded from clustering so a large removed
     background cannot steal a cluster centre from the actual artwork.
+
+    Returns ``(image, k, applied_sigma)``.
     """
     k = (
         _auto_k(analysis, params)
@@ -294,7 +339,7 @@ def _quantize(
 
     samples = rgb[visible_mask].astype(np.float32)
     if samples.shape[0] < k:
-        return result, 0
+        return result, 0, 0.0
 
     # --- fit centres on a subsample ---------------------------------------
     if samples.shape[0] > _KMEANS_FIT_SAMPLES:
@@ -304,10 +349,17 @@ def _quantize(
     else:
         fit_samples = samples
 
+    # k-means++ seeding uses OpenCV's own global RNG, which is not seeded by
+    # numpy. Without this the same image can produce different cluster centres
+    # - and so a different SVG - on every run. Determinism matters both for
+    # users re-exporting the same artwork and for the tests being meaningful.
+    cv2.setRNGSeed(0)
     criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
     _, _, centers = cv2.kmeans(
         fit_samples, k, None, criteria, 3, cv2.KMEANS_PP_CENTERS
     )
+    # Stable ordering so cluster indices do not permute between runs.
+    centers = centers[np.lexsort(centers.T[::-1])]
     centers = np.clip(centers, 0, 255).astype(np.float32)
 
     # --- assign every pixel to its nearest centre -------------------------
@@ -317,9 +369,40 @@ def _quantize(
         distances = ((chunk[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
         assigned[start : start + _ASSIGN_CHUNK] = distances.argmin(axis=1)
 
+    # --- optional boundary smoothing --------------------------------------
+    # Sigma is specified in output pixels, so scale it to the traced
+    # resolution: at 2x supersampling a 0.7px request means 1.4px here.
+    #
+    # There used to be an additional reduction here, scaling smoothing down for
+    # artwork with lots of axis-aligned edges. It was based on a measurement
+    # (smoothing improved a curved emblem but wrecked a rectilinear one) that
+    # two *later* fixes invalidated - correcting `corner_threshold` and adding
+    # background edge bleed. Re-measured afterwards, smoothing improves both:
+    # RMSE 8.15 -> 6.84 on the curved emblem and 9.42 -> 8.32 on the
+    # rectilinear one. The gate was left in place from the stale numbers and
+    # was cutting smoothing roughly in half on real badge artwork.
+    applied_sigma = params.boundary_smooth_sigma * supersample
+    if applied_sigma >= _MIN_EFFECTIVE_SIGMA:
+        label_map = np.zeros(result.shape[:2], dtype=np.int32)
+        label_map[visible_mask] = assigned
+        # Transparent pixels get their own class so smoothing cannot drag the
+        # artwork out over a removed background (or vice versa).
+        if (~visible_mask).any():
+            label_map[~visible_mask] = k
+            classes = k + 1
+        else:
+            classes = k
+
+        smoothed = _smooth_labels(label_map, classes, applied_sigma)
+        # Never let smoothing resurrect pixels that were made transparent.
+        smoothed_visible = visible_mask & (smoothed < k)
+        rgb[smoothed_visible] = centers[smoothed[smoothed_visible]].astype(np.uint8)
+        result[..., :3] = rgb
+        return result, k, applied_sigma
+
     rgb[visible_mask] = centers[assigned].astype(np.uint8)
     result[..., :3] = rgb
-    return result, k
+    return result, k, 0.0
 
 
 def _binarize(rgba: np.ndarray, params: PreprocessParams) -> np.ndarray:
