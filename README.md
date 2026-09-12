@@ -105,7 +105,7 @@ image-to-vector-poc/
 │   │   ├── photo_extractor.py  V2 garment-photo pipeline (stubbed, documented)
 │   │   └── future_engines.py   StarVector / Adobe placeholders
 │   ├── tests/
-│   │   ├── test_pipeline.py    41 tests incl. precision, curve + background regressions
+│   │   ├── test_pipeline.py    42 tests incl. precision, curve, palette + background regressions
 │   │   ├── make_samples.py     synthetic fixtures
 │   │   ├── make_logo_repro.py  dark-field serif emblem repro
 │   │   ├── make_badge_repro.py circular badge repro (curve quality)
@@ -150,6 +150,7 @@ Node API itself is healthy, and the frontend uses this to drive the badge.
 | `supersample` | no | `1`–`3`. Trace at this multiple of the working resolution, then scale back via the viewBox. |
 | `boundary_smooth_sigma` | no | `0`–`3` (output pixels, scaled by the supersample factor). Smooths sub-pixel noise off colour-region boundaries before tracing. `0` disables; under ~0.4 is a no-op. |
 | `background_edge_bleed` | no | Pixels of background eaten past the flood fill, to consume the anti-aliasing ramp. Default `1`; `0` keeps every pixel of artwork edge. |
+| `min_color_separation` | no | Merge palette entries closer than this RGB distance. Default `26`; `0` disables. |
 
 Success:
 
@@ -336,7 +337,7 @@ the GPU and credential constraints each brings.
 
 ## 9. Testing
 
-### Python (41 tests)
+### Python (42 tests)
 
 ```bat
 cd python-engine
@@ -483,14 +484,14 @@ A second reported case - a circular "Be happy" badge - was smooth in pixel
 terms but came back as visible polygons. Same harness, adding boundary
 smoothing and correcting `corner_threshold`:
 
-| Change | RMSE | Edge RMSE | straight segments |
-|---|---|---|---|
-| As reported | 8.00 | 20.50 | 43% |
-| + boundary smoothing, `corner_threshold` 40 -> 70, edge bleed | **6.84** | **17.69** | **3%** |
+| Change | RMSE | Edge RMSE | straight segments | segments |
+|---|---|---|---|---|
+| As reported | 7.55 | 19.47 | 25% | 2913 |
+| Now | **7.09** | **18.52** | **2%** | **1409** |
 
-Segment count 4003 -> 2029, on artwork made entirely of circles where every
-straight segment was an artifact. The rectilinear emblem improved at the same
-time: RMSE 10.12 -> 8.32, 70 paths -> 37, 72.8 KB -> 50.4 KB.
+Half the nodes and 78 KB -> 50 KB, on artwork made entirely of circles where
+every straight segment was an artifact. The rectilinear emblem improved at the
+same time: RMSE 10.12 -> 8.11, 70 paths -> 35, 72.8 KB -> 42 KB.
 
 ### The bugs behind it
 
@@ -585,7 +586,21 @@ time: RMSE 10.12 -> 8.32, 70 paths -> 37, 72.8 KB -> 50.4 KB.
     1 RMSE, so set it to `0` if you would rather keep the fringe than thin the
     strokes.
 
-13. **The pipeline was not deterministic.** `cv2.kmeans` seeds k-means++ from
+13. **The anti-aliasing ramp was being counted as colours.** `significant_colors`
+    counted over every pixel, so the transitional tones along each boundary
+    registered as colours in their own right - they cover plenty of pixels
+    because every outline contributes some. k-means then spent most of its
+    clusters describing the ramp: on a three-colour badge the palette came out
+    as dark, white, lilac **and five intermediate greys**, each of which the
+    tracer rendered as a thin band hugging an outline. Those bands are what
+    read as "bumps" on an otherwise clean edge - not jaggedness in the curve,
+    but a sliver of a slightly different colour lying on it. Counting only the
+    interiors of flat regions (excluding a few pixels either side of every
+    detected edge) reports 3 instead of 8, and `min_color_separation` fuses any
+    remaining near-duplicates. Regression test:
+    `test_palette_is_counted_from_flat_interiors`.
+
+14. **The pipeline was not deterministic.** `cv2.kmeans` seeds k-means++ from
     OpenCV's own global RNG, which numpy seeding does not touch, so the same
     image produced different cluster centres - and a different SVG - on every
     run. `cv2.setRNGSeed(0)` plus a stable ordering of the centres fixes it.

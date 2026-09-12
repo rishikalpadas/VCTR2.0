@@ -42,19 +42,18 @@ OUT_HTML = ROOT / "frontend" / "_quality.html"
 
 # (label, input file, reference file, preset, overrides)
 DEFAULT_RUNS = [
-    ("badge BEFORE (first report)", "badge_repro.jpg", "badge_repro.png", "logo",
+    ("badge FIRST REPORT", "badge_repro.jpg", "badge_repro.png", "logo",
      {"boundary_smooth_sigma": 0.0, "corner_threshold": 40, "length_threshold": 4.0,
-      "background_edge_bleed": 0}),
-    ("badge AFTER", "badge_repro.jpg", "badge_repro.png", "auto", None),
-    ("serif BEFORE (first report)", "logo_repro.jpg", "logo_repro.png", "logo",
+      "background_edge_bleed": 0, "min_color_separation": 0}),
+    ("badge NOW", "badge_repro.jpg", "badge_repro.png", "auto", None),
+    ("serif FIRST REPORT", "logo_repro.jpg", "logo_repro.png", "logo",
      {"boundary_smooth_sigma": 0.0, "corner_threshold": 40, "length_threshold": 4.0,
-      "background_edge_bleed": 0}),
-    ("serif AFTER", "logo_repro.jpg", "logo_repro.png", "auto", None),
+      "background_edge_bleed": 0, "min_color_separation": 0}),
+    ("serif NOW", "logo_repro.jpg", "logo_repro.png", "auto", None),
     ("flat_art sample", "sample_flat_art.png", "sample_flat_art.png", "flat_art",
      {"background": "never"}),
     ("typography sample", "sample_typography.png", "sample_typography.png",
      "typography", {"background": "never"}),
-    ("line_art sample", "sample_line_art.png", "sample_line_art.png", "line_art", None),
 ]
 
 
@@ -85,8 +84,8 @@ def run_case(label, source, reference, preset, overrides) -> dict:
         f"{label:28s} preset={meta['preset_used']:10s} "
         f"paths={meta['path_count']:5d} {meta['svg_bytes'] / 1024:7.1f}KB "
         f"{meta['processing_ms']:6.0f}ms "
-        f"ss={meta['supersample']} lines={seg['line_share']:.0%} "
-        f"seg={seg['segments']}"
+        f"lines={seg['line_share']:.0%} seg={seg['segments']} "
+        f"fills={len(set(__import__('re').findall(chr(102)+'ill=\"(#[0-9A-Fa-f]+)\"', outcome.svg)))}"
     )
     return {
         "label": f"{label} [{seg['line_share']:.0%} lines]",

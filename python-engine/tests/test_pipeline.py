@@ -394,6 +394,28 @@ class TestCurveQuality(unittest.TestCase):
     def _fill_count(svg: str) -> int:
         return len(set(re.findall(r'fill="(#[0-9A-Fa-f]{3,6})"', svg)))
 
+    def test_palette_is_counted_from_flat_interiors(self):
+        """Regression: the anti-aliasing ramp was being counted as colours.
+
+        Every boundary is a ramp, and on a lossy source a wide one. Counting
+        colours over all pixels made those ramp tones register as colours in
+        their own right, so k-means spent most of its clusters describing the
+        ramp - a three-colour badge produced dark, white, lilac and five
+        intermediate greys, each traced as a thin band hugging an outline.
+        """
+        image = Image.new("RGB", (600, 600), (204, 204, 253))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse((40, 40, 560, 560), outline=(45, 42, 50), width=9)
+        draw.ellipse((90, 90, 510, 510), outline=(45, 42, 50), width=9)
+        draw.ellipse((200, 200, 400, 400), fill=(252, 252, 250))
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=82, subsampling=2)
+
+        outcome = vectorize_bytes(buffer.getvalue(), preset_name="logo")
+        # Three real colours; allow a little headroom, but nowhere near the
+        # eight the whole-image count used to report.
+        self.assertLessEqual(outcome.meta["analysis"]["significant_colors"], 5)
+
     def test_smoothing_does_not_expand_the_palette(self):
         """Smoothing votes on cluster membership, so it cannot invent colours.
 

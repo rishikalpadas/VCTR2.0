@@ -138,6 +138,22 @@ class PreprocessParams:
     quantize_min_k: int = 4
     quantize_max_k: int = 24
 
+    # Minimum RGB distance between two surviving palette entries.
+    #
+    # k-means will happily spend clusters on colours the eye reads as one. On a
+    # three-colour badge saved as JPEG it produced ten, and the extras landed
+    # on the compression halo around every stroke: #CBCBFC alongside #CACAFA,
+    # #C9C9F8, #DBDAF8. Each became a thin band hugging an outline, traced as
+    # its own path. That is what reads as "bumps" along an otherwise clean
+    # edge - not jaggedness in the curve, but a sliver of a slightly different
+    # colour sitting on top of it.
+    #
+    # Smoothing cannot fix those; the band is a legitimate region, just a
+    # pointless one. Merging centres closer than this distance removes them
+    # outright. 0 disables. Raise it to flatten more aggressively; lower it if
+    # genuinely close colours in the artwork are being fused.
+    min_color_separation: float = 26.0
+
     # Majority-vote smoothing of the quantized colour regions, in OUTPUT
     # pixels (scaled internally by the supersample factor).
     #
@@ -153,8 +169,10 @@ class PreprocessParams:
     # segments from 52% to 3% and halved the file, at identical pixel fidelity.
     #
     # Only applies when quantization is on - it operates on the cluster labels.
-    # Too much rounds off genuine corners: 0.9 is safe, past ~1.2 letterforms
-    # start to soften.
+    # Measured on a circular badge: raising it from 0.7 to 1.1 cut the node
+    # count by 35% (2179 -> 1409 segments) and the file from 76 KB to 50 KB for
+    # a ~2% RMSE cost, which is the trade you want on curved artwork. Past ~1.5
+    # it starts rounding genuine detail and RMSE turns sharply worse.
     boundary_smooth_sigma: float = 0.0
 
     # Force the image to pure black/white before tracing (line art).
@@ -249,7 +267,7 @@ PRESETS: dict[str, Preset] = {
             jpeg_cleanup=True,
             quantize_colors="auto",
             quantize_max_k=10,
-            boundary_smooth_sigma=0.7,
+            boundary_smooth_sigma=1.1,
         ),
         engine_params=VTracerParams(
             filter_speckle=4,
@@ -283,7 +301,7 @@ PRESETS: dict[str, Preset] = {
             bilateral_diameter=5,
             quantize_colors="auto",
             quantize_max_k=12,
-            boundary_smooth_sigma=0.7,
+            boundary_smooth_sigma=1.0,
         ),
         engine_params=VTracerParams(
             filter_speckle=8,
@@ -311,7 +329,7 @@ PRESETS: dict[str, Preset] = {
             # Lighter than logo/flat_art: serif brackets and spurs are only a
             # couple of pixels across. In practice the adaptive safety factor
             # usually zeroes this for real lettering anyway.
-            boundary_smooth_sigma=0.5,
+            boundary_smooth_sigma=0.8,
         ),
         engine_params=VTracerParams(
             filter_speckle=6,
@@ -459,6 +477,7 @@ _PRE_OVERRIDES = {
     "remove_enclosed_background": bool,
     "jpeg_cleanup": bool,
     "boundary_smooth_sigma": lambda v: float(min(3.0, max(0.0, float(v)))),
+    "min_color_separation": lambda v: float(min(120.0, max(0.0, float(v)))),
     "quantize_colors": _cast_quantize,
 }
 

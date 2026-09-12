@@ -173,6 +173,46 @@ def _axis_aligned_share(gray: np.ndarray) -> float:
     return float(shares[[0, 1, 17, 18, 19, 35]].sum())
 
 
+def _count_significant_colors(
+    rgb: np.ndarray, alpha: np.ndarray, has_alpha: bool
+) -> int:
+    """Number of real, intentional colours, counted away from edges.
+
+    Every boundary in the artwork is an anti-aliasing ramp, and on a lossy
+    source it is a wide one. Count colours over the whole image and those ramp
+    tones register as colours in their own right - they cover plenty of pixels,
+    because every outline contributes some. Feed that inflated number to
+    k-means and it spends most of its clusters describing the ramp: a
+    three-colour badge produced dark, white, lilac and *five* intermediate
+    greys, each of which the tracer then rendered as a thin band hugging an
+    outline.
+
+    Excluding a few pixels either side of every detected edge leaves only the
+    interiors of flat regions, which is what "how many colours is this artwork"
+    actually means. Measured on the same badge: 5 counted over all pixels,
+    3 over interiors.
+    """
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 60, 150)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    interior = cv2.dilate(edges, kernel, iterations=1) == 0
+    if has_alpha:
+        interior &= alpha > 128
+
+    pixels = rgb[interior]
+    # Thin or busy artwork can be almost entirely edge; fall back rather than
+    # measure a handful of stray pixels.
+    if pixels.shape[0] < max(200, 0.05 * gray.size):
+        pixels = rgb[alpha > 128] if has_alpha else rgb.reshape(-1, 3)
+        if pixels.size == 0:
+            pixels = rgb.reshape(-1, 3)
+
+    quantized = (pixels // 8).astype(np.int32)
+    keys = quantized[:, 0] * 1024 + quantized[:, 1] * 32 + quantized[:, 2]
+    _, counts = np.unique(keys, return_counts=True)
+    return int((counts / counts.sum() >= _SIGNIFICANT_COLOR_SHARE).sum())
+
+
 def _nearest_significant_distance(
     bucket_keys: np.ndarray,
     counts: np.ndarray,
@@ -231,10 +271,8 @@ def analyze(rgba: np.ndarray) -> ImageAnalysis:
     top_color_coverage = float(np.sort(counts)[::-1][:8].sum() / total)
 
     # A colour is "significant" if it covers at least this share of the visible
-    # pixels on its own. Compression artifacts and anti-aliasing steps are
-    # spread thinly across many buckets and fall below the line; real flat
-    # regions sit far above it.
-    significant_colors = int((counts / total >= _SIGNIFICANT_COLOR_SHARE).sum())
+    # pixels on its own - counted over flat-region INTERIORS only.
+    significant_colors = _count_significant_colors(rgb, alpha, has_alpha)
 
     channel_spread = np.abs(
         visible[:, 0].astype(np.int16) - visible[:, 1].astype(np.int16)

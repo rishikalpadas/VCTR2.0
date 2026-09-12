@@ -283,6 +283,54 @@ _ASSIGN_CHUNK = 400_000
 _MIN_EFFECTIVE_SIGMA = 0.8
 
 
+def _merge_close_centers(
+    centers: np.ndarray, labels: np.ndarray, min_separation: float
+) -> tuple[np.ndarray, np.ndarray]:
+    """Fuse palette entries the eye cannot tell apart.
+
+    Greedy: repeatedly take the closest pair of surviving centres and, if they
+    are nearer than ``min_separation``, fold the less populous one into the
+    more populous one. The survivor keeps its own colour rather than a blend,
+    so the dominant flat region is not shifted by absorbing its own edge halo.
+
+    Returns the reduced palette and the labels remapped onto it.
+    """
+    if min_separation <= 0 or centers.shape[0] < 2:
+        return centers, labels
+
+    counts = np.bincount(labels, minlength=centers.shape[0]).astype(np.int64)
+    # remap[i] is the surviving centre index that original centre i now uses.
+    remap = np.arange(centers.shape[0])
+    alive = np.ones(centers.shape[0], dtype=bool)
+
+    while alive.sum() > 1:
+        live_idx = np.flatnonzero(alive)
+        live = centers[live_idx].astype(np.float32)
+        diff = live[:, None, :] - live[None, :, :]
+        distances = np.sqrt((diff**2).sum(axis=2))
+        np.fill_diagonal(distances, np.inf)
+
+        flat = distances.argmin()
+        a, b = np.unravel_index(flat, distances.shape)
+        if distances[a, b] >= min_separation:
+            break
+
+        first, second = live_idx[a], live_idx[b]
+        # Keep whichever covers more pixels; the other is the halo.
+        keep, drop = (
+            (first, second) if counts[first] >= counts[second] else (second, first)
+        )
+        remap[remap == drop] = keep
+        counts[keep] += counts[drop]
+        counts[drop] = 0
+        alive[drop] = False
+
+    survivors = np.flatnonzero(alive)
+    compact = np.zeros(centers.shape[0], dtype=np.int32)
+    compact[survivors] = np.arange(survivors.size)
+    return centers[survivors], compact[remap][labels]
+
+
 def _smooth_labels(
     labels: np.ndarray, cluster_count: int, sigma: float
 ) -> np.ndarray:
@@ -369,6 +417,14 @@ def _quantize(
         distances = ((chunk[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
         assigned[start : start + _ASSIGN_CHUNK] = distances.argmin(axis=1)
 
+    # --- collapse near-duplicate palette entries --------------------------
+    # Do this before smoothing: the halo bands are legitimate regions, so
+    # smoothing would just give them tidier edges instead of removing them.
+    centers, assigned = _merge_close_centers(
+        centers, assigned, params.min_color_separation
+    )
+    effective_k = int(centers.shape[0])
+
     # --- optional boundary smoothing --------------------------------------
     # Sigma is specified in output pixels, so scale it to the traced
     # resolution: at 2x supersampling a 0.7px request means 1.4px here.
@@ -388,21 +444,21 @@ def _quantize(
         # Transparent pixels get their own class so smoothing cannot drag the
         # artwork out over a removed background (or vice versa).
         if (~visible_mask).any():
-            label_map[~visible_mask] = k
-            classes = k + 1
+            label_map[~visible_mask] = effective_k
+            classes = effective_k + 1
         else:
-            classes = k
+            classes = effective_k
 
         smoothed = _smooth_labels(label_map, classes, applied_sigma)
         # Never let smoothing resurrect pixels that were made transparent.
-        smoothed_visible = visible_mask & (smoothed < k)
+        smoothed_visible = visible_mask & (smoothed < effective_k)
         rgb[smoothed_visible] = centers[smoothed[smoothed_visible]].astype(np.uint8)
         result[..., :3] = rgb
-        return result, k, applied_sigma
+        return result, effective_k, applied_sigma
 
     rgb[visible_mask] = centers[assigned].astype(np.uint8)
     result[..., :3] = rgb
-    return result, k, 0.0
+    return result, effective_k, 0.0
 
 
 def _binarize(rgba: np.ndarray, params: PreprocessParams) -> np.ndarray:
