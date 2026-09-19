@@ -69,10 +69,10 @@
       <div class="field">
         <label for="backgroundSelect">Background</label>
         <select id="backgroundSelect">
-          <option value="">Use the preset's default</option>
+          <option value="never" selected>Keep the background</option>
           <option value="auto">Auto - remove only if clearly flat</option>
+          <option value="">Use the preset's default</option>
           <option value="always">Always remove</option>
-          <option value="never">Keep the background</option>
         </select>
         <p class="field__help">
           Removal is a flood fill from the image border, so artwork that merely
