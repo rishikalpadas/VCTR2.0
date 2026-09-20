@@ -8,7 +8,7 @@
 (function () {
   'use strict';
 
-  var API = { health: '/api/health', vectorize: '/api/vectorize' };
+  var API = { health: '/api/health', vectorize: '/api/vectorize', exportPdf: '/api/export/pdf' };
 
   var MAX_BYTES = 15 * 1024 * 1024;
   var ACCEPTED = ['image/png', 'image/jpeg', 'image/webp'];
@@ -34,6 +34,7 @@
     'errorBox', 'errorMessage', 'errorCode',
     'resultPanel', 'vtracerPreview', 'potracePreview',
     'vtracerStats', 'potraceStats', 'vtracerDownload', 'potraceDownload',
+    'vtracerDownloadPdf', 'potraceDownloadPdf',
     'sideVtracer', 'sidePotrace', 'pickVtracer', 'pickPotrace', 'pickClear',
     'engineStatusVtracer', 'engineStatusPotrace',
   ].forEach(function (id) { el[id] = document.getElementById(id); });
@@ -43,6 +44,7 @@
     objectUrl: null,
     busy: false,
     results: { vtracer: null, potrace: null }, // { svgText, svgUrl, meta }
+    exporting: { vtracer: false, potrace: false },
   };
 
   // --- helpers --------------------------------------------------------------
@@ -298,6 +300,53 @@
     triggerDownload(result.svgUrl, baseName() + '-' + engine + '.svg');
   }
 
+  /**
+   * PDF is produced server-side from the SVG already on hand, so it matches
+   * the preview exactly and costs no re-trace - same as the main app.
+   */
+  function downloadPdf(engine) {
+    var result = state.results[engine];
+    if (!result || state.exporting[engine]) return;
+
+    var button = engine === 'vtracer' ? el.vtracerDownloadPdf : el.potraceDownloadPdf;
+    var original = button.textContent;
+    state.exporting[engine] = true;
+    button.disabled = true;
+    button.textContent = 'Preparing PDF…';
+    clearError();
+
+    fetch(API.exportPdf + '?name=' + encodeURIComponent(baseName() + '-' + engine), {
+      method: 'POST',
+      headers: { 'Content-Type': 'image/svg+xml' },
+      body: result.svgText,
+    })
+      .then(function (res) {
+        if (res.ok) return res.blob();
+        return res.json()
+          .catch(function () {
+            throw new Error('PDF export failed (HTTP ' + res.status + ').');
+          })
+          .then(function (body) {
+            var err = new Error((body.error && body.error.message) || 'PDF export failed.');
+            err.code = body.error && body.error.code;
+            throw err;
+          });
+      })
+      .then(function (blob) {
+        var href = URL.createObjectURL(blob);
+        triggerDownload(href, baseName() + '-' + engine + '.pdf');
+        setTimeout(function () { revoke(href); }, 10000);
+      })
+      .catch(function (err) {
+        showError(err.message || 'Could not export the PDF.', err.code || 'PDF_EXPORT_FAILED');
+      })
+      .finally(function () {
+        state.exporting[engine] = false;
+        button.disabled = false;
+        button.textContent = original;
+      });
+  }
+
   // --- wiring -----------------------------------------------------------
 
   el.browseBtn.addEventListener('click', function (event) {
@@ -338,6 +387,8 @@
   el.runBtn.addEventListener('click', run);
   el.vtracerDownload.addEventListener('click', function () { downloadResult('vtracer'); });
   el.potraceDownload.addEventListener('click', function () { downloadResult('potrace'); });
+  el.vtracerDownloadPdf.addEventListener('click', function () { downloadPdf('vtracer'); });
+  el.potraceDownloadPdf.addEventListener('click', function () { downloadPdf('potrace'); });
 
   el.presetSelect.addEventListener('change', function () {
     el.presetHelp.textContent = PRESET_HELP[el.presetSelect.value] || '';

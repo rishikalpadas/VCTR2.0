@@ -84,10 +84,10 @@
         <div class="field">
           <label for="backgroundSelect">Background removal</label>
           <select id="backgroundSelect">
-            <option value="">preset default</option>
+            <option value="never" selected>Keep</option>
             <option value="auto">Auto</option>
+            <option value="">Preset's default</option>
             <option value="always">Always</option>
-            <option value="never">Never</option>
           </select>
         </div>
         <div class="field">
@@ -184,6 +184,7 @@
         <dl class="stats" id="vtracerStats"></dl>
         <div class="actions">
           <button type="button" class="btn btn--ghost" id="vtracerDownload">Download SVG</button>
+          <button type="button" class="btn btn--ghost" id="vtracerDownloadPdf">Download PDF</button>
         </div>
       </figure>
       <figure class="compare__side" id="sidePotrace">
@@ -192,6 +193,7 @@
         <dl class="stats" id="potraceStats"></dl>
         <div class="actions">
           <button type="button" class="btn btn--ghost" id="potraceDownload">Download SVG</button>
+          <button type="button" class="btn btn--ghost" id="potraceDownloadPdf">Download PDF</button>
         </div>
       </figure>
     </div>
