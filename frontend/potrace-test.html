@@ -22,6 +22,56 @@
   }
   a.btn { text-decoration: none; }
   .compare__side.is-winner .canvas { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash); }
+
+  .zoom-toggle {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    justify-content: center;
+    margin: 0 0 20px;
+  }
+  .zoom-toggle__pct {
+    min-width: 48px;
+    text-align: center;
+    font-size: 12.5px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  /* Deep zoom re-renders the SVG at every level instead of stretching a
+     bitmap - see registerZoomPort() in potrace-test.js. The stage is sized
+     as a percentage of the viewport and translated for panning; nothing is
+     ever resampled, so edges stay sharp all the way to the zoom cap. */
+  .canvas.zoomport {
+    position: relative;
+    padding: 0;
+    cursor: zoom-in;
+    outline: none;
+    touch-action: none;
+  }
+  .canvas.zoomport.is-panning { cursor: grabbing; }
+  .canvas.zoomport.is-zoomed { cursor: grab; }
+  .zoomstage {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 100%;
+    height: 100%;
+    transform: translate(-50%, -50%);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+  }
+  .zoomstage > img {
+    width: 100%;
+    height: 100%;
+    max-width: none;
+    max-height: none;
+    object-fit: contain;
+    display: block;
+  }
 </style>
 </head>
 <body>
@@ -177,10 +227,20 @@
       <button type="button" class="chip" id="pickClear">Clear</button>
     </div>
 
+    <div class="zoom-toggle">
+      <span class="backdrop-toggle__label">Zoom</span>
+      <button type="button" class="chip" id="zoomOutBtn" title="Zoom out">−</button>
+      <span class="zoom-toggle__pct" id="zoomReadout">100%</span>
+      <button type="button" class="chip" id="zoomInBtn" title="Zoom in">+</button>
+      <button type="button" class="chip" id="zoomFitBtn" title="Reset to fit">Fit</button>
+    </div>
+
     <div class="compare">
       <figure class="compare__side" id="sideVtracer">
         <figcaption>VTracer</figcaption>
-        <div class="canvas backdrop backdrop--checker"><img id="vtracerPreview" alt="VTracer output"></div>
+        <div class="canvas backdrop backdrop--checker zoomport" id="vtracerZoomport" tabindex="0">
+          <div class="zoomstage" id="vtracerStage"><img id="vtracerPreview" alt="VTracer output"></div>
+        </div>
         <dl class="stats" id="vtracerStats"></dl>
         <div class="actions">
           <button type="button" class="btn btn--ghost" id="vtracerDownload">Download SVG</button>
@@ -189,7 +249,9 @@
       </figure>
       <figure class="compare__side" id="sidePotrace">
         <figcaption>Potrace</figcaption>
-        <div class="canvas backdrop backdrop--checker"><img id="potracePreview" alt="Potrace output"></div>
+        <div class="canvas backdrop backdrop--checker zoomport" id="potraceZoomport" tabindex="0">
+          <div class="zoomstage" id="potraceStage"><img id="potracePreview" alt="Potrace output"></div>
+        </div>
         <dl class="stats" id="potraceStats"></dl>
         <div class="actions">
           <button type="button" class="btn btn--ghost" id="potraceDownload">Download SVG</button>
@@ -198,7 +260,7 @@
       </figure>
     </div>
 
-    <p class="zoom-note">Zoom in (Ctrl/Cmd + scroll, or open each SVG in a new tab) to compare edge smoothness at 400%+ — that is where jagged vs. clean curve-fitting actually shows.</p>
+    <p class="zoom-note">Scroll to zoom, drag to pan, double-click to zoom in — both panels move together, so you're always comparing the same region. Edge smoothness is easiest to judge past 400%.</p>
   </section>
 
 </main>

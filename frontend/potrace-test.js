@@ -37,6 +37,8 @@
     'vtracerDownloadPdf', 'potraceDownloadPdf',
     'sideVtracer', 'sidePotrace', 'pickVtracer', 'pickPotrace', 'pickClear',
     'engineStatusVtracer', 'engineStatusPotrace',
+    'vtracerZoomport', 'potraceZoomport', 'vtracerStage', 'potraceStage',
+    'zoomInBtn', 'zoomOutBtn', 'zoomFitBtn', 'zoomReadout',
   ].forEach(function (id) { el[id] = document.getElementById(id); });
 
   var state = {
@@ -223,6 +225,7 @@
       .then(function (bodies) {
         renderResult('vtracer', bodies[0]);
         renderResult('potrace', bodies[1]);
+        resetZoom(); // a new pair of images at the old pan/zoom would be showing the wrong region
         show(el.resultPanel);
         el.resultPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
       })
@@ -274,6 +277,133 @@
       wrap.appendChild(dt);
       wrap.appendChild(dd);
       node.appendChild(wrap);
+    });
+  }
+
+  // --- zoom ------------------------------------------------------------------
+  // Both panels share one { zoom, x, y } state, so panning or zooming either
+  // one moves both in lockstep - the point is comparing the same region at
+  // the same scale, not two independently-scrolled images. Deep zoom keeps
+  // curves sharp because the *stage* is resized (forcing the SVG-backed
+  // <img> to re-render at that size) rather than a CSS scale transform,
+  // which would just stretch a fixed bitmap. Same technique as the
+  // SmartVectorZoom component on the mydesignbazaar /engine-lab page.
+
+  var ZOOM_MIN = 1;
+  var ZOOM_MAX = 64;
+  var ZOOM_BUTTON_STEP = 1.6;
+  var zoomView = { zoom: 1, x: 0, y: 0 };
+  var zoomPorts = []; // [{ viewport, stage }]
+
+  function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+  function clampPan(x, y, z, w, h) {
+    var maxX = Math.max(0, (w * (z - 1)) / 2);
+    var maxY = Math.max(0, (h * (z - 1)) / 2);
+    return { x: clamp(x, -maxX, maxX), y: clamp(y, -maxY, maxY) };
+  }
+
+  function renderZoomViews() {
+    zoomPorts.forEach(function (p) {
+      p.stage.style.width = (zoomView.zoom * 100) + '%';
+      p.stage.style.height = (zoomView.zoom * 100) + '%';
+      p.stage.style.transform = 'translate(-50%,-50%) translate(' + zoomView.x + 'px,' + zoomView.y + 'px)';
+      p.viewport.classList.toggle('is-zoomed', zoomView.zoom > ZOOM_MIN);
+    });
+    if (el.zoomReadout) {
+      el.zoomReadout.textContent = zoomView.zoom < 10
+        ? Math.round(zoomView.zoom * 100) + '%'
+        : zoomView.zoom.toFixed(1) + '×';
+    }
+    if (el.zoomOutBtn) el.zoomOutBtn.disabled = zoomView.zoom <= ZOOM_MIN;
+    if (el.zoomFitBtn) el.zoomFitBtn.disabled = zoomView.zoom <= ZOOM_MIN;
+    if (el.zoomInBtn) el.zoomInBtn.disabled = zoomView.zoom >= ZOOM_MAX;
+  }
+
+  /** Zoom to nextZoomFn(currentZoom), keeping the content point under
+   * (ax, ay) - viewport-relative pixels, defaulting to centre - fixed on
+   * screen. `viewport` supplies the reference size (both panels are always
+   * the same size, so any registered one works for a button-triggered,
+   * unanchored zoom). */
+  function applyZoom(nextZoomFn, ax, ay, viewport) {
+    var rect = viewport.getBoundingClientRect();
+    var w = rect.width, h = rect.height;
+    if (!w || !h) return;
+    var anchorX = ax == null ? w / 2 : ax;
+    var anchorY = ay == null ? h / 2 : ay;
+    var prev = zoomView;
+    var z = clamp(nextZoomFn(prev.zoom), ZOOM_MIN, ZOOM_MAX);
+    if (z === prev.zoom) return;
+
+    var originX = w / 2 - (w * prev.zoom) / 2 + prev.x;
+    var originY = h / 2 - (h * prev.zoom) / 2 + prev.y;
+    var u = (anchorX - originX) / (w * prev.zoom);
+    var v = (anchorY - originY) / (h * prev.zoom);
+    var nx = anchorX - w / 2 + (w * z) / 2 - u * w * z;
+    var ny = anchorY - h / 2 + (h * z) / 2 - v * h * z;
+    var panned = clampPan(nx, ny, z, w, h);
+    zoomView = { zoom: z, x: panned.x, y: panned.y };
+    renderZoomViews();
+  }
+
+  function resetZoom() {
+    zoomView = { zoom: 1, x: 0, y: 0 };
+    renderZoomViews();
+  }
+
+  function registerZoomPort(viewport, stage) {
+    zoomPorts.push({ viewport: viewport, stage: stage });
+    var dragState = null;
+
+    viewport.addEventListener('wheel', function (e) {
+      e.preventDefault();
+      var rect = viewport.getBoundingClientRect();
+      var dy = e.deltaMode === 1 ? e.deltaY * 16
+        : e.deltaMode === 2 ? e.deltaY * (viewport.clientHeight || 400)
+        : e.deltaY;
+      applyZoom(function (z) { return z * Math.exp(-dy * 0.0015); },
+        e.clientX - rect.left, e.clientY - rect.top, viewport);
+    }, { passive: false });
+
+    viewport.addEventListener('pointerdown', function (e) {
+      if (zoomView.zoom <= ZOOM_MIN) return;
+      dragState = { id: e.pointerId, sx: e.clientX, sy: e.clientY, px: zoomView.x, py: zoomView.y };
+      viewport.setPointerCapture(e.pointerId);
+      viewport.classList.add('is-panning');
+    });
+
+    viewport.addEventListener('pointermove', function (e) {
+      if (!dragState || dragState.id !== e.pointerId) return;
+      var rect = viewport.getBoundingClientRect();
+      var panned = clampPan(
+        dragState.px + (e.clientX - dragState.sx),
+        dragState.py + (e.clientY - dragState.sy),
+        zoomView.zoom, rect.width, rect.height
+      );
+      zoomView = { zoom: zoomView.zoom, x: panned.x, y: panned.y };
+      renderZoomViews();
+    });
+
+    function endDrag(e) {
+      if (!dragState || dragState.id !== e.pointerId) return;
+      dragState = null;
+      viewport.classList.remove('is-panning');
+    }
+    viewport.addEventListener('pointerup', endDrag);
+    viewport.addEventListener('pointercancel', endDrag);
+
+    viewport.addEventListener('dblclick', function (e) {
+      var rect = viewport.getBoundingClientRect();
+      if (zoomView.zoom >= ZOOM_MAX) { resetZoom(); return; }
+      applyZoom(function (z) { return z * 2; }, e.clientX - rect.left, e.clientY - rect.top, viewport);
+    });
+
+    viewport.addEventListener('keydown', function (e) {
+      if (e.key === '+' || e.key === '=') applyZoom(function (z) { return z * ZOOM_BUTTON_STEP; }, null, null, viewport);
+      else if (e.key === '-' || e.key === '_') applyZoom(function (z) { return z / ZOOM_BUTTON_STEP; }, null, null, viewport);
+      else if (e.key === '0') resetZoom();
+      else return;
+      e.preventDefault();
     });
   }
 
@@ -418,6 +548,14 @@
   el.pickVtracer.addEventListener('click', function () { pick('vtracer'); });
   el.pickPotrace.addEventListener('click', function () { pick('potrace'); });
   el.pickClear.addEventListener('click', function () { pick(null); });
+
+  registerZoomPort(el.vtracerZoomport, el.vtracerStage);
+  registerZoomPort(el.potraceZoomport, el.potraceStage);
+  renderZoomViews();
+
+  el.zoomInBtn.addEventListener('click', function () { applyZoom(function (z) { return z * ZOOM_BUTTON_STEP; }, null, null, el.vtracerZoomport); });
+  el.zoomOutBtn.addEventListener('click', function () { applyZoom(function (z) { return z / ZOOM_BUTTON_STEP; }, null, null, el.vtracerZoomport); });
+  el.zoomFitBtn.addEventListener('click', resetZoom);
 
   window.addEventListener('beforeunload', function () {
     revoke(state.objectUrl);
