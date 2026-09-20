@@ -62,6 +62,44 @@ class VTracerParams:
 
 
 @dataclass(frozen=True)
+class PotraceParams:
+    """Mirrors the potrace 1.16 CLI 1:1. Defaults match the CLI's own defaults.
+
+    Potrace only traces one colour (black) per invocation. The engine builds
+    one binary mask per surviving colour in the already-quantized image and
+    runs the binary once per mask, so these thresholds are pixel-denominated
+    exactly like VTracer's and need the same supersample rescaling - see
+    ``scale_engine_params``.
+    """
+
+    turnpolicy: Literal[
+        "black", "white", "left", "right", "minority", "majority", "random"
+    ] = "minority"
+    # Speckle filter (an *area*, in pixels): suppress regions up to this size.
+    turdsize: int = 2
+    # Corner threshold. 0 = every vertex is a sharp corner; above ~1.334 =
+    # always fit a curve. Opposite direction from VTracer's corner_threshold
+    # (which is 0-100 and higher = more curve-friendly) - do not port the
+    # number across, tune it fresh.
+    alphamax: float = 1.0
+    # Bezier curve-fitting tolerance.
+    opttolerance: float = 0.2
+    # Cap on distinct colour layers traced. Each layer is one subprocess call,
+    # so this bounds worst-case latency on artwork that reached this engine
+    # unquantized. Presets that already quantize (flat_art, logo, ...) never
+    # get near it.
+    max_layers: int = 32
+
+    def as_cli_args(self) -> list[str]:
+        return [
+            "-z", self.turnpolicy,
+            "-t", str(self.turdsize),
+            "-a", str(self.alphamax),
+            "-O", str(self.opttolerance),
+        ]
+
+
+@dataclass(frozen=True)
 class PreprocessParams:
     # Working resolution of the artwork itself: the longest edge the image is
     # reduced to before tracing. Everything is mapped back via the viewBox.
@@ -219,7 +257,7 @@ class Preset:
     description: str
     engine: str = "vtracer"
     preprocess: PreprocessParams = field(default_factory=PreprocessParams)
-    engine_params: VTracerParams = field(default_factory=VTracerParams)
+    engine_params: VTracerParams | PotraceParams = field(default_factory=VTracerParams)
     optimize: OptimizeParams = field(default_factory=OptimizeParams)
 
 
@@ -406,14 +444,17 @@ AUTO_PRESET_DESCRIPTION = (
 )
 
 
-def scale_engine_params(params: VTracerParams, factor: float) -> VTracerParams:
+def scale_engine_params(
+    params: VTracerParams | PotraceParams, factor: float
+) -> VTracerParams | PotraceParams:
     """Rescale pixel-denominated engine thresholds for a supersampled trace.
 
     Every one of these thresholds is expressed in pixels of the image actually
     handed to the tracer. Trace a 2x image without touching them and:
 
-      * ``filter_speckle`` (an *area*) suppresses a quarter of what it should,
-        so noise that used to be filtered now survives as paths;
+      * ``filter_speckle``/``turdsize`` (an *area*) suppresses a quarter of
+        what it should, so noise that used to be filtered now survives as
+        paths;
       * ``length_threshold`` (a *length*) stops merging short segments, so the
         node count roughly doubles for no extra fidelity.
 
@@ -422,6 +463,11 @@ def scale_engine_params(params: VTracerParams, factor: float) -> VTracerParams:
     """
     if factor <= 1.0:
         return params
+
+    if isinstance(params, PotraceParams):
+        return replace(
+            params, turdsize=max(1, round(params.turdsize * factor * factor))
+        )
 
     return replace(
         params,
@@ -498,6 +544,24 @@ _ENGINE_OVERRIDES = {
     "mode": str,
 }
 
+_POTRACE_ENGINE_OVERRIDES = {
+    "turnpolicy": str,
+    "turdsize": int,
+    "alphamax": float,
+    "opttolerance": float,
+}
+
+# A client may force a different tracing backend onto an existing preset (used
+# by the engine-comparison test page to hold preprocessing identical while
+# swapping only the tracer). Whitelisted for the same reason every other
+# override is: the browser must not reach a backend we have not thought about.
+_ALLOWED_ENGINES = {"vtracer", "potrace"}
+
+_ENGINE_DEFAULT_PARAMS: dict[str, type] = {
+    "vtracer": VTracerParams,
+    "potrace": PotraceParams,
+}
+
 
 def apply_overrides(preset: Preset, overrides: dict | None) -> Preset:
     """Return a copy of ``preset`` with per-request overrides applied."""
@@ -510,15 +574,30 @@ def apply_overrides(preset: Preset, overrides: dict | None) -> Preset:
         if key in overrides
         and (overrides[key] is not None or key in _NULLABLE_PRE)
     }
-    engine_changes = {
-        key: cast(overrides[key])
-        for key, cast in _ENGINE_OVERRIDES.items()
-        if overrides.get(key) is not None
-    }
 
     updated = preset
     if pre_changes:
         updated = replace(updated, preprocess=replace(updated.preprocess, **pre_changes))
+
+    requested_engine = overrides.get("engine")
+    if requested_engine in _ALLOWED_ENGINES and requested_engine != updated.engine:
+        # Switching tracer families: the old engine_params dataclass does not
+        # apply to the new one, so start from that engine's own defaults
+        # rather than trying to carry fields across.
+        updated = replace(
+            updated,
+            engine=requested_engine,
+            engine_params=_ENGINE_DEFAULT_PARAMS[requested_engine](),
+        )
+
+    engine_override_map = (
+        _POTRACE_ENGINE_OVERRIDES if updated.engine == "potrace" else _ENGINE_OVERRIDES
+    )
+    engine_changes = {
+        key: cast(overrides[key])
+        for key, cast in engine_override_map.items()
+        if overrides.get(key) is not None
+    }
     if engine_changes:
         updated = replace(
             updated, engine_params=replace(updated.engine_params, **engine_changes)

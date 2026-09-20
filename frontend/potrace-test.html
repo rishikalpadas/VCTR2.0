@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>VTracer vs Potrace — Engine Comparison</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* A few additions on top of the shared stylesheet, scoped to this page. */
+  .engine-badges { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; }
+  .subtle { color: var(--ink-faint); font-size: 12px; font-weight: 400; }
+  .param-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 16px 20px;
+  }
+  .winner-pick {
+    display: flex;
+    gap: 8px;
+    justify-content: center;
+    margin: 4px 0 20px;
+  }
+  a.btn { text-decoration: none; }
+  .compare__side.is-winner .canvas { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-wash); }
+</style>
+</head>
+<body>
+
+<div class="masthead">
+  <h1>VTracer vs Potrace</h1>
+  <p class="tagline">One upload, identical preprocessing, two tracers. Judge edge quality side by side.</p>
+  <div class="status-strip engine-badges">
+    <span id="engineStatusVtracer" class="badge badge--pending">checking…</span>
+    <span id="engineStatusPotrace" class="badge badge--pending">checking…</span>
+  </div>
+</div>
+
+<main>
+
+  <section class="panel">
+    <h2><span class="step">1</span> Upload artwork</h2>
+
+    <div class="dropzone" id="dropZone" tabindex="0" role="button" aria-label="Choose an image">
+      <svg class="dropzone__icon" viewBox="0 0 24 24"><path d="M12 16V4M12 4l-5 5M12 4l5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg>
+      <p class="dropzone__title">Drop an image here, or click to browse</p>
+      <p class="dropzone__hint">PNG, JPG/JPEG or WebP, up to 15 MB</p>
+      <button type="button" id="browseBtn" class="btn btn--ghost">Choose file</button>
+      <input type="file" id="fileInput" accept="image/png,image/jpeg,image/webp" hidden>
+      <p class="dropzone__formats">Same upload is traced by both engines — no need to pick one side.</p>
+    </div>
+
+    <div class="file-meta" id="fileMeta" hidden>
+      <div class="file-meta__thumb"><img id="thumbPreview" alt=""></div>
+      <dl class="file-meta__facts">
+        <div><dt>Name</dt><dd id="fileName">—</dd></div>
+        <div><dt>Size</dt><dd id="fileSize">—</dd></div>
+        <div><dt>Dimensions</dt><dd id="fileDims">—</dd></div>
+        <div><dt>Type</dt><dd id="fileType">—</dd></div>
+      </dl>
+      <button type="button" id="clearBtn" class="btn btn--text">Remove</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2><span class="step">2</span> Shared preprocessing <span class="subtle">— applied identically to both engines, so only the tracer differs</span></h2>
+
+    <div class="field">
+      <label for="presetSelect">Preset</label>
+      <select id="presetSelect">
+        <option value="auto">Auto</option>
+        <option value="standard">Standard</option>
+        <option value="logo">Logo</option>
+        <option value="flat_art">Flat art</option>
+        <option value="typography">Typography</option>
+        <option value="line_art">Line art</option>
+        <option value="detailed">Detailed</option>
+      </select>
+      <p class="field__help" id="presetHelp"></p>
+    </div>
+
+    <details class="advanced">
+      <summary>Advanced preprocessing overrides</summary>
+      <div class="param-grid">
+        <div class="field">
+          <label for="backgroundSelect">Background removal</label>
+          <select id="backgroundSelect">
+            <option value="">preset default</option>
+            <option value="auto">Auto</option>
+            <option value="always">Always</option>
+            <option value="never">Never</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="maxDimInput">Max dimension (px)</label>
+          <input type="number" id="maxDimInput" min="200" max="4000" placeholder="preset default">
+        </div>
+        <div class="field">
+          <label for="supersampleInput">Supersample</label>
+          <input type="number" id="supersampleInput" step="0.1" min="1" max="3" placeholder="preset default">
+        </div>
+        <div class="field">
+          <label for="smoothInput">Boundary smoothing (σ)</label>
+          <input type="number" id="smoothInput" step="0.1" min="0" max="3" placeholder="preset default">
+        </div>
+      </div>
+      <label class="checkbox">
+        <input type="checkbox" id="enclosedCheck">
+        Remove enclosed background regions (letter counters, ring holes)
+      </label>
+    </details>
+  </section>
+
+  <section class="panel">
+    <h2><span class="step">3</span> Potrace tuning <span class="subtle">— VTracer keeps its preset's own defaults</span></h2>
+    <div class="param-grid">
+      <div class="field">
+        <label for="turnpolicySelect">Turn policy</label>
+        <select id="turnpolicySelect">
+          <option value="minority" selected>minority (default)</option>
+          <option value="majority">majority</option>
+          <option value="black">black</option>
+          <option value="white">white</option>
+          <option value="left">left</option>
+          <option value="right">right</option>
+          <option value="random">random</option>
+        </select>
+        <p class="field__help">How potrace resolves ambiguous pixel corners.</p>
+      </div>
+      <div class="field">
+        <label for="turdsizeInput">Turdsize (speckle filter, px²)</label>
+        <input type="number" id="turdsizeInput" value="2" min="0" max="100">
+        <p class="field__help">Suppresses regions up to this pixel area.</p>
+      </div>
+      <div class="field">
+        <label for="alphamaxInput">Alphamax (corner threshold)</label>
+        <input type="number" id="alphamaxInput" value="1.0" step="0.05" min="0" max="1.5">
+        <p class="field__help">0 = every vertex a sharp corner. ~1.33+ = always fit a curve.</p>
+      </div>
+      <div class="field">
+        <label for="opttoleranceInput">Opttolerance (curve fit)</label>
+        <input type="number" id="opttoleranceInput" value="0.2" step="0.05" min="0" max="1">
+        <p class="field__help">Bezier fitting tolerance — higher simplifies more.</p>
+      </div>
+    </div>
+  </section>
+
+  <button type="button" id="runBtn" class="btn btn--primary" disabled>Compare</button>
+
+  <div class="progress" id="progress" hidden>
+    <div class="spinner"></div>
+    <div>
+      <p class="progress__title">Tracing with both engines…</p>
+      <p class="progress__detail" id="progressDetail">Uploading and analysing the image</p>
+    </div>
+  </div>
+
+  <div class="alert alert--error" id="errorBox" hidden>
+    <strong id="errorTitle">Something went wrong</strong>
+    <p id="errorMessage"></p>
+    <span class="alert__code" id="errorCode"></span>
+  </div>
+
+  <section class="panel" id="resultPanel" hidden>
+    <h2>Result</h2>
+
+    <div class="backdrop-toggle">
+      <span class="backdrop-toggle__label">Preview backdrop</span>
+      <button type="button" class="chip is-active" data-backdrop="checker">Checker</button>
+      <button type="button" class="chip" data-backdrop="light">Light</button>
+      <button type="button" class="chip" data-backdrop="dark">Dark</button>
+    </div>
+
+    <div class="winner-pick">
+      <span class="subtle">Looks cleaner:</span>
+      <button type="button" class="chip" id="pickVtracer">VTracer</button>
+      <button type="button" class="chip" id="pickPotrace">Potrace</button>
+      <button type="button" class="chip" id="pickClear">Clear</button>
+    </div>
+
+    <div class="compare">
+      <figure class="compare__side" id="sideVtracer">
+        <figcaption>VTracer</figcaption>
+        <div class="canvas backdrop backdrop--checker"><img id="vtracerPreview" alt="VTracer output"></div>
+        <dl class="stats" id="vtracerStats"></dl>
+        <div class="actions">
+          <button type="button" class="btn btn--ghost" id="vtracerDownload">Download SVG</button>
+        </div>
+      </figure>
+      <figure class="compare__side" id="sidePotrace">
+        <figcaption>Potrace</figcaption>
+        <div class="canvas backdrop backdrop--checker"><img id="potracePreview" alt="Potrace output"></div>
+        <dl class="stats" id="potraceStats"></dl>
+        <div class="actions">
+          <button type="button" class="btn btn--ghost" id="potraceDownload">Download SVG</button>
+        </div>
+      </figure>
+    </div>
+
+    <p class="zoom-note">Zoom in (Ctrl/Cmd + scroll, or open each SVG in a new tab) to compare edge smoothness at 400%+ — that is where jagged vs. clean curve-fitting actually shows.</p>
+  </section>
+
+</main>
+
+<div class="footer">
+  <p>Diagnostic page — not linked from the main app. Calls the same <code>/api/vectorize</code> endpoint twice per run, once per engine.</p>
+</div>
+
+<script src="potrace-test.js"></script>
+</body>
+</html>

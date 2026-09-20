@@ -26,6 +26,13 @@ scikit-image==0.26.0
 # VTracer (Rust core, Python bindings). CPU only.
 vtracer==0.6.15
 
+# Potrace 1.16 has no dependency here: the only Python binding on PyPI
+# ("potracer") was checked against known shapes during development and
+# returned wrong path geometry, so engines/potrace_engine.py drives the real
+# C binary as a subprocess instead. The binary is vendored at
+# vendor/potrace/potrace.exe (downloaded from potrace.sourceforge.net,
+# verified against its published SHA1SUMS) - nothing to install.
+
 # --- SVG optimization ------------------------------------------------------
 scour==0.38.2
 

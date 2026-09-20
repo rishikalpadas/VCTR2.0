@@ -21,10 +21,20 @@ const VALID_PRESETS = new Set([
 ]);
 
 const BOOLEAN_OPTIONS = ['remove_enclosed_background'];
-const NUMBER_OPTIONS = ['max_dimension', 'background_tolerance', 'filter_speckle', 'color_precision'];
-const FLOAT_OPTIONS = ['supersample', 'boundary_smooth_sigma'];
-const STRING_OPTIONS = ['background'];
+const NUMBER_OPTIONS = [
+  'max_dimension', 'background_tolerance', 'filter_speckle', 'color_precision',
+  'turdsize',
+];
+const FLOAT_OPTIONS = ['supersample', 'boundary_smooth_sigma', 'alphamax', 'opttolerance'];
+const STRING_OPTIONS = ['background', 'turnpolicy'];
 const VALID_BACKGROUND_MODES = new Set(['auto', 'always', 'never']);
+const VALID_TURN_POLICIES = new Set(['black', 'white', 'left', 'right', 'minority', 'majority', 'random']);
+
+// Forces a specific tracing backend onto whatever preset was chosen, holding
+// every other preprocessing option equal - used by the engine-comparison
+// test page. Validated the same way `preset` is: reject rather than forward
+// anything not on the list.
+const VALID_ENGINES = new Set(['vtracer', 'potrace']);
 
 /**
  * Build the override object from form fields.
@@ -57,7 +67,13 @@ function parseOptions(body) {
     if (body[key] === undefined || body[key] === '') continue;
     const value = String(body[key]);
     if (key === 'background' && !VALID_BACKGROUND_MODES.has(value)) continue;
+    if (key === 'turnpolicy' && !VALID_TURN_POLICIES.has(value)) continue;
     options[key] = value;
+  }
+
+  if (body.engine !== undefined && body.engine !== '') {
+    const engine = String(body.engine);
+    if (VALID_ENGINES.has(engine)) options.engine = engine;
   }
 
   return options;
