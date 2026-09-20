@@ -26,6 +26,7 @@ fill="#hex"/>`` elements.
 
 from __future__ import annotations
 
+import platform
 import re
 import subprocess
 import tempfile
@@ -45,7 +46,12 @@ from .base import BaseVectorizer, EngineResult, registry
 log = get_logger(__name__)
 
 _BIN_DIR = Path(__file__).resolve().parent.parent / "vendor" / "potrace"
-_POTRACE_EXE = _BIN_DIR / "potrace.exe"
+# The vendored binary is platform-specific (downloaded from
+# potrace.sourceforge.net's own precompiled distributions - see the
+# module docstring). "potrace.exe" only exists on the Windows dev box this
+# was built on; a Linux/macOS deployment needs the matching ELF/Mach-O
+# binary dropped in next to it, named plain "potrace".
+_POTRACE_EXE = _BIN_DIR / ("potrace.exe" if platform.system() == "Windows" else "potrace")
 
 _SVG_NS = "http://www.w3.org/2000/svg"
 _GROUP_TRANSFORM_RE = re.compile(
