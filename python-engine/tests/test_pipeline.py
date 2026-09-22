@@ -40,6 +40,7 @@ from svg_export import (  # noqa: E402
 )
 from svg_optimizer import validate_svg  # noqa: E402
 from vectorizer import vectorize_bytes  # noqa: E402
+from engines.potrace_engine import _trap_layers  # noqa: E402
 
 SAMPLES = Path(__file__).resolve().parents[2] / "samples"
 
@@ -770,6 +771,73 @@ class TestLinework(unittest.TestCase):
         visible = prepared.image[prepared.image[..., 3] > 0][:, :3]
         present = {"#{:02x}{:02x}{:02x}".format(*map(int, c)) for c in np.unique(visible, axis=0)}
         self.assertTrue(present <= set(prepared.palette), present - set(prepared.palette))
+
+
+class TestLayerSeams(unittest.TestCase):
+    """The trap that stops the background showing through a shared boundary.
+
+    Potrace fits every colour layer's outline on its own mask, so the boundary
+    two regions share comes back as two curves a fraction of a pixel apart.
+    Where a curve falls inside its own mask the pixels it gave up belong to no
+    layer - the neighbour's mask never held them either - and they render as
+    background: the white slivers that run along the line work.
+    """
+
+    @staticmethod
+    def bands(count: int = 3, height: int = 10, width: int = 8):
+        """``count`` stacked bands, in paint order, tiling the canvas exactly."""
+        return [
+            (
+                f"#{i:02x}0000",
+                np.repeat(np.arange(count * height) // height == i, width).reshape(
+                    count * height, width
+                ),
+            )
+            for i in range(count)
+        ]
+
+    def trap(self, radius=2, smooth=0.0, **kw):
+        base = self.bands(**kw)
+        return base, _trap_layers(base, radius, smooth)
+
+    def test_a_layer_grows_into_the_layers_painted_after_it(self):
+        base, grown = self.trap()
+        for i in range(len(base) - 1):
+            later = np.logical_or.reduce([m for _, m in base[i + 1:]])
+            self.assertTrue(
+                (grown[i][1] & later).any(),
+                f"layer {i} did not reach the layer painted after it",
+            )
+
+    def test_a_layer_never_grows_into_a_layer_painted_before_it(self):
+        """Growing backwards would cover a neighbour and move the boundary."""
+        base, grown = self.trap()
+        for i in range(1, len(base)):
+            earlier = np.logical_or.reduce([m for _, m in base[:i]])
+            self.assertFalse(
+                (grown[i][1] & earlier).any(),
+                f"layer {i} swallowed part of a layer painted before it",
+            )
+
+    def test_the_last_layer_is_left_alone(self):
+        """``_ink_on_top`` puts the line work last, so this is stroke width."""
+        base, grown = self.trap()
+        np.testing.assert_array_equal(grown[-1][1], base[-1][1])
+
+    def test_trapping_stays_inside_the_artwork(self):
+        """Growth may overlap a neighbour; it may not spill onto bare canvas."""
+        base, grown = self.trap()
+        before = np.logical_or.reduce([m for _, m in base])
+        after = np.logical_or.reduce([m for _, m in grown])
+        np.testing.assert_array_equal(after, before)
+
+    def test_colours_and_order_survive_the_trap(self):
+        base, grown = self.trap()
+        self.assertEqual([c for c, _ in grown], [c for c, _ in base])
+
+    def test_trapping_can_be_switched_off(self):
+        base, grown = self.trap(radius=0)
+        self.assertIs(grown, base)
 
 
 def small_pale_region(size: int = 1200) -> Image.Image:

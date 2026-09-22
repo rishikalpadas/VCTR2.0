@@ -81,9 +81,33 @@ class PotraceParams:
     # always fit a curve. Opposite direction from VTracer's corner_threshold
     # (which is 0-100 and higher = more curve-friendly) - do not port the
     # number across, tune it fresh.
-    alphamax: float = 1.0
+    #
+    # Below potrace's own 1.0 default on purpose. Flat art is full of real
+    # corners - tent apexes, letter joins, the point where two colour bands
+    # meet - and at 1.0 potrace rounds them into arcs. Measured on the badge
+    # artwork: 1.0 -> 0.6 drops RMSE at the line work's corners 21.47 -> 20.96
+    # and, despite more raw segments, makes the *optimized* file smaller
+    # (103.6 -> 101.7 KB), because a corner costs a line where an arc costs a
+    # cubic. Going further (0.4) buys another 0.1 for 18% more segments.
+    alphamax: float = 0.6
     # Bezier curve-fitting tolerance.
     opttolerance: float = 0.2
+    # Seam trap, in traced pixels. Every colour layer is traced on its own
+    # mask, so the boundary two regions share comes back as two independently
+    # fitted curves. Where a curve undercuts its own mask the pixels it
+    # dropped belong to no layer at all and the background shows through as a
+    # white sliver. Each layer is grown by this much into the area that later
+    # layers will paint over, which closes the gap from both sides without
+    # moving any visible boundary - see ``_trap_layers``. 0 disables it.
+    #
+    # Not rescaled for supersampling: it compensates for the tracer's curve
+    # fit, which undercuts by about a pixel of whatever it is handed, not by a
+    # fraction of the artwork.
+    trap_radius: int = 2
+    # Re-smooth the grown mask. Dilation leaves a staircase that potrace then
+    # spends segments fitting; a blur and re-threshold costs nothing in
+    # accuracy and gave back 8% of the file size. 0 disables it.
+    trap_smooth: float = 0.8
     # Cap on distinct colour layers traced. Each layer is one subprocess call,
     # so this bounds worst-case latency on artwork that reached this engine
     # unquantized. Presets that already quantize (flat_art, logo, ...) never
@@ -638,6 +662,8 @@ _POTRACE_ENGINE_OVERRIDES = {
     "turdsize": int,
     "alphamax": float,
     "opttolerance": float,
+    "trap_radius": lambda v: int(min(8, max(0, int(v)))),
+    "trap_smooth": lambda v: float(min(3.0, max(0.0, float(v)))),
 }
 
 # A client may force a different tracing backend onto an existing preset (used
