@@ -92,22 +92,26 @@ class PotraceParams:
     alphamax: float = 0.6
     # Bezier curve-fitting tolerance.
     opttolerance: float = 0.2
-    # Seam trap, in traced pixels. Every colour layer is traced on its own
-    # mask, so the boundary two regions share comes back as two independently
-    # fitted curves. Where a curve undercuts its own mask the pixels it
-    # dropped belong to no layer at all and the background shows through as a
-    # white sliver. Each layer is grown by this much into the area that later
-    # layers will paint over, which closes the gap from both sides without
-    # moving any visible boundary - see ``_trap_layers``. 0 disables it.
+    # Seam underlay width, in traced pixels. Every colour layer is traced on
+    # its own mask, so the boundary two regions share comes back as two
+    # independently fitted curves a fraction of a pixel apart. Where both
+    # curves fall inside their own mask the pixels between them belong to no
+    # layer at all and the background shows through: the white slivers that
+    # run along the line work. The line work's own path is emitted a second
+    # time underneath everything, stroked this wide, so those slivers land on
+    # ink instead of on nothing - see ``_ink_underlay``. 0 disables it.
+    #
+    # Filling the gaps with the *neighbouring colour* instead was measured and
+    # rejected: it closed the same gaps but tripled the amount of colour
+    # showing inside the stroke corridor (1,868 -> 7,013 px), which reads as a
+    # magenta fringe along every dark line. Growing the strokes themselves
+    # until nothing could show through was also rejected - it works (bleed
+    # 2,489 -> 2 px) but takes the line work to 1.33x the source weight.
     #
     # Not rescaled for supersampling: it compensates for the tracer's curve
-    # fit, which undercuts by about a pixel of whatever it is handed, not by a
+    # fit, which is off by about a pixel of whatever it is handed, not by a
     # fraction of the artwork.
-    trap_radius: int = 2
-    # Re-smooth the grown mask. Dilation leaves a staircase that potrace then
-    # spends segments fitting; a blur and re-threshold costs nothing in
-    # accuracy and gave back 8% of the file size. 0 disables it.
-    trap_smooth: float = 0.8
+    seam_underlay: float = 2.0
     # Cap on distinct colour layers traced. Each layer is one subprocess call,
     # so this bounds worst-case latency on artwork that reached this engine
     # unquantized. Presets that already quantize (flat_art, logo, ...) never
@@ -662,8 +666,7 @@ _POTRACE_ENGINE_OVERRIDES = {
     "turdsize": int,
     "alphamax": float,
     "opttolerance": float,
-    "trap_radius": lambda v: int(min(8, max(0, int(v)))),
-    "trap_smooth": lambda v: float(min(3.0, max(0.0, float(v)))),
+    "seam_underlay": lambda v: float(min(8.0, max(0.0, float(v)))),
 }
 
 # A client may force a different tracing backend onto an existing preset (used

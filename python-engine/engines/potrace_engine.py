@@ -95,7 +95,6 @@ class PotraceVectorizer(BaseVectorizer):
         layers = _extract_color_layers(
             rgba, max_layers=params.max_layers, skip_lightest=skip_background
         )
-        layers = _trap_layers(layers, params.trap_radius, params.trap_smooth)
 
         if not layers:
             raise EngineError(
@@ -105,6 +104,7 @@ class PotraceVectorizer(BaseVectorizer):
 
         path_elements: list[str] = []
         layer_meta: list[dict] = []
+        traced: list[tuple[str, list[str]]] = []
 
         with tempfile.TemporaryDirectory(prefix="potrace_") as tmp:
             tmp_dir = Path(tmp)
@@ -146,6 +146,9 @@ class PotraceVectorizer(BaseVectorizer):
                     path_elements.append(f'<path fill="{hex_color}" d="{d}"/>')
                 if ds:
                     layer_meta.append({"color": hex_color, "subpaths": len(ds)})
+                    traced.append((hex_color, ds))
+
+        path_elements = _ink_underlay(traced, params.seam_underlay) + path_elements
 
         if not path_elements:
             raise EngineError(
@@ -280,52 +283,44 @@ def _ink_on_top(order, colors: np.ndarray) -> list[int]:
     return [int(i) for i in order if int(i) != darkest] + [darkest]
 
 
-def _trap_layers(
-    layers: list[tuple[str, np.ndarray]], radius: int, smooth: float
-) -> list[tuple[str, np.ndarray]]:
-    """Grow each layer under the layers painted after it, to close seams.
+def _ink_underlay(
+    traced: list[tuple[str, list[str]]], width: float
+) -> list[str]:
+    """Repeat the line work underneath everything, stroked, to back the seams.
 
-    The masks coming out of ``_extract_color_layers`` tile the artwork exactly,
-    but potrace fits each one's boundary on its own. Two curves approximating
-    the same pixel edge land a fraction of a pixel apart, and wherever a curve
-    falls *inside* its own mask the pixels it gave up are claimed by nobody -
-    the neighbour's mask never contained them either. Those pixels render as
-    the background showing through: the white slivers along the line work.
+    Every layer's outline is fitted on its own mask, so the edge two regions
+    share comes back as two curves a fraction of a pixel apart. Where both fall
+    inside their own mask the pixels between them are painted by nobody - the
+    neighbour's mask never held them either - and the background shows through
+    as a white sliver along the line work.
 
-    Growing a layer into its neighbour closes the gap, but growing it into a
-    neighbour painted *earlier* also covers that neighbour, and the shared
-    boundary moves by the growth radius. So each layer is grown only into the
-    union of the layers painted after it. Both sides of every seam are then
-    covered - the earlier layer grows under the later one, and the later one
-    paints its own exact mask back on top - and no visible boundary moves.
+    Something has to fill that sliver, and the choice of what is the whole
+    problem. The neighbouring fill is the obvious candidate and the wrong one:
+    it also has to grow *into* the stroke corridor to get there, so the sliver
+    turns from white to a bright fringe running alongside every dark line,
+    which is far more visible than the gap it replaced. Widening the strokes
+    until nothing can show through works, but a gap that averages a tenth of a
+    pixel costs two thirds of a pixel of stroke everywhere to cover.
 
-    The last layer grows nowhere, which is what keeps the line work honest:
-    ``_ink_on_top`` puts the ink there, so every fill spreads *under* the
-    strokes and the strokes keep the width they were traced at.
+    So the line work is emitted twice: once here at the bottom, stroked, where
+    the only part of it that is ever seen is whatever pokes out from under the
+    fills - exactly the slivers - and once on top at its traced width, which is
+    what the strokes actually measure. Reusing the same path data rather than
+    tracing a dilated mask keeps the two copies exactly concentric and saves a
+    potrace pass.
 
-    Measured on the badge artwork: unpainted pixels 4,094 -> 394 (-90%) and
-    RMSE against the quantized raster 6.93 -> 5.94, for 26% more optimized
-    bytes.
+    Measured on the badge artwork: unpainted pixels 3,762 -> 513, and colour
+    inside the stroke corridor 2,489 -> 1,867, with the strokes at 1.02x the
+    weight they trace to.
     """
-    if radius <= 0 or len(layers) < 2:
-        return layers
-
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
-    )
-    later = np.zeros_like(layers[0][1])
-    grown: list[tuple[str, np.ndarray]] = []
-    for hex_color, mask in reversed(layers):
-        if later.any():
-            spread = cv2.dilate(mask.astype(np.uint8), kernel).astype(bool)
-            mask = mask | (spread & later)
-            if smooth > 0:
-                blurred = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), smooth)
-                mask = blurred >= 0.5
-        grown.append((hex_color, mask))
-        later = later | mask
-    grown.reverse()
-    return grown
+    if width <= 0 or len(traced) < 2:
+        return []
+    hex_color, ds = traced[-1]  # _ink_on_top traced the line work last
+    return [
+        f'<path fill="{hex_color}" stroke="{hex_color}" stroke-width="{width:g}" '
+        f'stroke-linejoin="round" stroke-linecap="round" d="{d}"/>'
+        for d in ds
+    ]
 
 
 def _requantize(

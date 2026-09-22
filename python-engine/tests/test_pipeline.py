@@ -31,7 +31,7 @@ from errors import (  # noqa: E402
 )
 import pathstats  # noqa: E402
 from image_io import load_image  # noqa: E402
-from preprocessing import preprocess  # noqa: E402
+from preprocessing import _dissolve_edge_films, preprocess  # noqa: E402
 from presets import apply_overrides, get_preset  # noqa: E402
 from svg_export import (  # noqa: E402
     MAX_SVG_BYTES,
@@ -40,7 +40,7 @@ from svg_export import (  # noqa: E402
 )
 from svg_optimizer import validate_svg  # noqa: E402
 from vectorizer import vectorize_bytes  # noqa: E402
-from engines.potrace_engine import _trap_layers  # noqa: E402
+from engines.potrace_engine import _ink_underlay  # noqa: E402
 
 SAMPLES = Path(__file__).resolve().parents[2] / "samples"
 
@@ -773,71 +773,119 @@ class TestLinework(unittest.TestCase):
         self.assertTrue(present <= set(prepared.palette), present - set(prepared.palette))
 
 
+class TestEdgeFilms(unittest.TestCase):
+    """The hairline of a wrong colour that anti-aliasing leaves on a stroke.
+
+    A stroke's anti-aliased edge is a blend of the ink and whatever it runs
+    over, and quantization has to put that blend on some palette entry. When a
+    real colour of the artwork sits near the blend in RGB it collects the whole
+    edge, and every stroke comes back wrapped in a hairline of a colour that is
+    nowhere near it in the drawing.
+    """
+
+    INK, PALE, PURPLE = (39, 39, 39), (208, 229, 230), (167, 112, 194)
+    PALETTE = np.array([INK, PALE, PURPLE], dtype=np.uint8)
+
+    def art(self, film=PURPLE):
+        """Ink bar, one row of ``film`` under it, pale below, real purple away."""
+        image = np.zeros((40, 40, 4), dtype=np.uint8)
+        image[..., 3] = 255
+        image[:20, :, :3] = self.INK
+        image[20, :, :3] = film
+        image[21:, :, :3] = self.PALE
+        image[30:, 30:, :3] = self.PURPLE
+        original = image[..., :3].copy()
+        original[20] = (176, 196, 197)  # the blend it really was: nearer pale
+        return image, original
+
+    def test_a_film_against_the_ink_is_reassigned(self):
+        image, original = self.art()
+        out, changed = _dissolve_edge_films(image, self.PALETTE, original)
+        self.assertEqual(changed, 40)
+        np.testing.assert_array_equal(out[20, :, :3], np.tile(self.PALE, (40, 1)))
+
+    def test_it_resolves_to_the_side_the_pixel_came_from(self):
+        """Nearer the ink in the original, so it belongs to the stroke."""
+        image, original = self.art()
+        original[20] = (70, 70, 70)
+        out, _ = _dissolve_edge_films(image, self.PALETTE, original)
+        np.testing.assert_array_equal(out[20, :, :3], np.tile(self.INK, (40, 1)))
+
+    def test_a_real_region_of_the_same_colour_survives(self):
+        """The colour is not the evidence - being a hairline on ink is."""
+        image, original = self.art()
+        out, _ = _dissolve_edge_films(image, self.PALETTE, original)
+        np.testing.assert_array_equal(out[30:, 30:, :3], image[30:, 30:, :3])
+
+    def test_a_hairline_of_ink_is_never_dissolved(self):
+        """Thin dark strokes are the one thing that really is a pixel wide."""
+        image = np.zeros((40, 40, 4), dtype=np.uint8)
+        image[..., 3] = 255
+        image[:, :, :3] = self.PALE
+        image[20, :, :3] = self.INK
+        out, changed = _dissolve_edge_films(image, self.PALETTE, image[..., :3].copy())
+        self.assertEqual(changed, 0)
+        np.testing.assert_array_equal(out[20, :, :3], np.tile(self.INK, (40, 1)))
+
+    def test_the_result_holds_palette_colours_only(self):
+        """Each stray blend left behind costs Potrace a layer and a subprocess."""
+        image, original = self.art(film=(123, 134, 135))
+        out, _ = _dissolve_edge_films(image, self.PALETTE, original)
+        present = np.unique(out[..., :3].reshape(-1, 3), axis=0)
+        for colour in present.tolist():
+            self.assertIn(colour, self.PALETTE.tolist(), f"{colour} is off-palette")
+
+
 class TestLayerSeams(unittest.TestCase):
-    """The trap that stops the background showing through a shared boundary.
+    """The underlay that stops the background showing through a shared boundary.
 
     Potrace fits every colour layer's outline on its own mask, so the boundary
     two regions share comes back as two curves a fraction of a pixel apart.
-    Where a curve falls inside its own mask the pixels it gave up belong to no
+    Where both fall inside their own mask the pixels between them belong to no
     layer - the neighbour's mask never held them either - and they render as
     background: the white slivers that run along the line work.
     """
 
-    @staticmethod
-    def bands(count: int = 3, height: int = 10, width: int = 8):
-        """``count`` stacked bands, in paint order, tiling the canvas exactly."""
-        return [
-            (
-                f"#{i:02x}0000",
-                np.repeat(np.arange(count * height) // height == i, width).reshape(
-                    count * height, width
-                ),
-            )
-            for i in range(count)
-        ]
+    TRACED = [("#ff0000", ["M0 0h4v4h-4z"]), ("#272727", ["M1 1h2v2h-2z", "M8 8h1v1z"])]
 
-    def trap(self, radius=2, smooth=0.0, **kw):
-        base = self.bands(**kw)
-        return base, _trap_layers(base, radius, smooth)
+    def test_the_underlay_repeats_the_line_work(self):
+        """The last layer traced is the ink, and it is what backs the seams."""
+        under = _ink_underlay(self.TRACED, 2.0)
+        self.assertEqual(len(under), len(self.TRACED[-1][1]))
+        for element, d in zip(under, self.TRACED[-1][1]):
+            self.assertIn(f'd="{d}"', element)
+            self.assertIn('fill="#272727"', element)
 
-    def test_a_layer_grows_into_the_layers_painted_after_it(self):
-        base, grown = self.trap()
-        for i in range(len(base) - 1):
-            later = np.logical_or.reduce([m for _, m in base[i + 1:]])
-            self.assertTrue(
-                (grown[i][1] & later).any(),
-                f"layer {i} did not reach the layer painted after it",
-            )
+    def test_the_underlay_is_stroked_in_its_own_colour(self):
+        """A fill alone would cover nothing extra - the stroke is the margin."""
+        element = _ink_underlay(self.TRACED, 2.0)[0]
+        self.assertIn('stroke="#272727"', element)
+        self.assertIn('stroke-width="2"', element)
 
-    def test_a_layer_never_grows_into_a_layer_painted_before_it(self):
-        """Growing backwards would cover a neighbour and move the boundary."""
-        base, grown = self.trap()
-        for i in range(1, len(base)):
-            earlier = np.logical_or.reduce([m for _, m in base[:i]])
-            self.assertFalse(
-                (grown[i][1] & earlier).any(),
-                f"layer {i} swallowed part of a layer painted before it",
-            )
+    def test_the_underlay_never_repeats_a_fill(self):
+        """Backing a seam with a colour is what puts a fringe on every stroke."""
+        for element in _ink_underlay(self.TRACED, 2.0):
+            self.assertNotIn("#ff0000", element)
 
-    def test_the_last_layer_is_left_alone(self):
-        """``_ink_on_top`` puts the line work last, so this is stroke width."""
-        base, grown = self.trap()
-        np.testing.assert_array_equal(grown[-1][1], base[-1][1])
+    def test_the_underlay_can_be_switched_off(self):
+        self.assertEqual(_ink_underlay(self.TRACED, 0), [])
 
-    def test_trapping_stays_inside_the_artwork(self):
-        """Growth may overlap a neighbour; it may not spill onto bare canvas."""
-        base, grown = self.trap()
-        before = np.logical_or.reduce([m for _, m in base])
-        after = np.logical_or.reduce([m for _, m in grown])
-        np.testing.assert_array_equal(after, before)
+    def test_a_single_layer_needs_no_underlay(self):
+        """Nothing is painted over it, so it has no seam to lose."""
+        self.assertEqual(_ink_underlay(self.TRACED[:1], 2.0), [])
 
-    def test_colours_and_order_survive_the_trap(self):
-        base, grown = self.trap()
-        self.assertEqual([c for c, _ in grown], [c for c, _ in base])
-
-    def test_trapping_can_be_switched_off(self):
-        base, grown = self.trap(radius=0)
-        self.assertIs(grown, base)
+    def test_the_underlay_is_painted_first(self):
+        """Painted last it would widen every stroke instead of backing it."""
+        outcome = vectorize_bytes(
+            png_bytes(keylined_art()),
+            preset_name="logo",
+            overrides={"background": "never", "engine": "potrace"},
+        )
+        fills = re.findall(r'<path[^>]*?fill="(#[0-9a-fA-F]{6})"[^>]*?>', outcome.svg)
+        stroked = re.findall(r'<path[^>]*?stroke="(#[0-9a-fA-F]{6})"[^>]*?>', outcome.svg)
+        self.assertTrue(stroked, "no underlay was emitted")
+        self.assertEqual(fills[0], stroked[0], f"underlay is not first: {fills[:3]}")
+        self.assertEqual(fills[-1], stroked[0], "line work is not painted last")
 
 
 def small_pale_region(size: int = 1200) -> Image.Image:

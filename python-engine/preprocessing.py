@@ -114,6 +114,10 @@ def preprocess(
     working, supersample = _supersample(working, params, steps)
 
     if params.quantize_colors is not None:
+        # Kept for _dissolve_edge_films: once the palette has been written the
+        # anti-aliased colour a boundary pixel actually had is gone, and that
+        # is the only thing that says which side of the boundary it was on.
+        pre_quantize = working[..., :3].copy()
         working, used_k, smoothed, palette = _quantize(
             working, params, analysis, supersample
         )
@@ -138,6 +142,10 @@ def preprocess(
             )
             if restored:
                 steps.append(f"linework_restored({restored:,}px)")
+        if palette is not None:
+            working, dissolved = _dissolve_edge_films(working, palette, pre_quantize)
+            if dissolved:
+                steps.append(f"edge_films_dissolved({dissolved:,}px)")
 
     if params.binarize:
         working = _binarize(working, params)
@@ -528,6 +536,88 @@ def _smooth_labels(
 # 0.67 - measured on a 2px rule in a 2400px source traced at 2200 - and the
 # whole point of the spine is that such a stroke still survives.
 _INK_SPINE = 0.6
+
+
+def _dissolve_edge_films(
+    rgba: np.ndarray, palette: np.ndarray, original: np.ndarray
+) -> tuple[np.ndarray, int]:
+    """Reassign one-pixel films of a colour pressed against the line work.
+
+    An anti-aliased stroke edge is a blend of the ink and whatever the stroke
+    runs over, and k-means has to put that blend on *some* centre. When a real
+    colour of the artwork happens to sit near the blend in RGB it collects the
+    whole edge, and the stroke comes back wrapped in a hairline of a colour
+    that appears nowhere near it in the drawing. Measured on the badge
+    artwork: 651 pixels of purple lining the strokes of a tent drawn only in
+    pale blue, because a 50/50 mix of #272727 and #d0e5e6 lands almost exactly
+    on #a770c2 in luma.
+
+    Tracing cannot fix this and should not try - the film is really there in
+    the raster, so every engine faithfully reproduces it as a magenta fringe.
+
+    A film is recognised by shape rather than colour: it does not survive an
+    opening by a single pixel, no part of its own colour's body is within a
+    pixel of it, and it touches the ink. Artwork that thin *and* pressed
+    against a stroke is the stroke's own edge. Each film pixel is then
+    re-quantized against only the labels around it, starting from its
+    pre-quantization colour, so it lands on whichever side it truly belonged
+    to instead of being handed wholesale to one of them.
+
+    The ink itself is never dissolved: thin dark strokes are the one thing in
+    this pipeline that genuinely are a pixel wide, and keeping them is what
+    ``_restore_linework`` exists for.
+
+    Runs last, on the finished raster. Quantization is not the only thing that
+    leaves films - restoring the line work stamps ink through regions that were
+    already labelled, which strands a pixel of the old colour along the new
+    stroke. Measured on the badge artwork, only 38 of the eventual 651 purple
+    film pixels existed at the point quantization finished.
+    """
+    rgb = rgba[..., :3]
+    visible = rgba[..., 3] >= 128
+    reference = original.astype(np.float32)
+    swatches = palette.astype(np.float32)
+
+    labels = np.abs(
+        rgb.astype(np.float32)[:, :, None, :] - swatches[None, None, :, :]
+    ).sum(axis=3).argmin(axis=2)
+
+    ink = int(np.argmin(swatches @ np.array([0.299, 0.587, 0.114], np.float32)))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    near_ink = cv2.dilate(((labels == ink) & visible).astype(np.uint8), kernel) > 0
+
+    film = np.zeros(labels.shape, dtype=bool)
+    for index in range(len(palette)):
+        if index == ink:
+            continue
+        mask = ((labels == index) & visible).astype(np.uint8)
+        if not mask.any():
+            continue
+        core = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        film |= mask.astype(bool) & ~(cv2.dilate(core, kernel) > 0)
+    film &= near_ink
+
+    resolved = labels
+    if film.any():
+        best = np.full(labels.shape, np.inf, dtype=np.float32)
+        resolved = labels.copy()
+        for index in range(len(palette)):
+            body = ((labels == index) & visible & ~film).astype(np.uint8)
+            if not body.any():
+                continue
+            distance = np.abs(reference - swatches[index]).sum(axis=2)
+            take = film & (cv2.dilate(body, kernel) > 0) & (distance < best)
+            best[take] = distance[take]
+            resolved[take] = index
+
+    # Writing every visible pixel through the palette, not just the dissolved
+    # ones, is what makes "the preprocessed image contains only palette
+    # colours" true rather than nearly true. Restoring the line work had been
+    # leaving a couple of hundred stray blends behind, and each distinct one
+    # costs the Potrace engine a colour layer and a subprocess.
+    result = rgba.copy()
+    result[..., :3][visible] = palette[resolved[visible]]
+    return result, int((resolved != labels).sum())
 
 
 def _to_hex(color: np.ndarray) -> str:
