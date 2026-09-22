@@ -45,6 +45,10 @@ class PreprocessResult:
     steps: list[str]
     background: dict
     warnings: list[str]
+    # Exact colours quantization wrote into the image, as hex. None when
+    # quantization is off, in which case there is no palette to hold the
+    # tracer to.
+    palette: list[str] | None = None
 
 
 def preprocess(
@@ -68,9 +72,21 @@ def preprocess(
     """
     steps: list[str] = []
     warnings: list[str] = []
+    palette: np.ndarray | None = None
     original_height, original_width = rgba.shape[:2]
 
+    # Thin dark strokes are the first casualty of everything below: the
+    # downscale averages them into their neighbours and the majority vote in
+    # _smooth_labels then loses what is left. Record where they are at source
+    # resolution now, while the information still exists.
+    ink, dark = (
+        _ink_mask(rgba, params.linework_max_luma, params.linework_min_contrast)
+        if params.preserve_linework
+        else (None, None)
+    )
+
     working, base_scale = _resize(rgba, params, steps)
+    working = _clamp_border(working)
 
     if params.jpeg_cleanup and source_format in ("jpeg", "webp"):
         working = _jpeg_cleanup(working)
@@ -98,10 +114,30 @@ def preprocess(
     working, supersample = _supersample(working, params, steps)
 
     if params.quantize_colors is not None:
-        working, used_k, smoothed = _quantize(working, params, analysis, supersample)
+        working, used_k, smoothed, palette = _quantize(
+            working, params, analysis, supersample
+        )
         steps.append(f"quantize(k={used_k})")
         if smoothed:
             steps.append(f"boundary_smooth(sigma={smoothed:.2g})")
+        if ink is not None and palette is not None:
+            working, restored = _restore_linework(
+                working,
+                ink,
+                dark,
+                palette,
+                params.linework_max_luma,
+                # Specified in output pixels like boundary_smooth_sigma, so it
+                # has to move with the traced resolution the same way.
+                sigma=params.linework_smooth_sigma * supersample,
+                threshold=params.linework_coverage,
+                # Already in tracing-resolution pixels, unlike the sigmas
+                # above: _restore_linework converts it to source pixels itself
+                # using the scale it can see.
+                max_width=params.linework_max_width,
+            )
+            if restored:
+                steps.append(f"linework_restored({restored:,}px)")
 
     if params.binarize:
         working = _binarize(working, params)
@@ -127,6 +163,7 @@ def preprocess(
         steps=steps,
         background=background_report,
         warnings=warnings,
+        palette=None if palette is None else [_to_hex(c) for c in palette],
     )
 
 
@@ -190,6 +227,26 @@ def _supersample(
     upscaled = cv2.resize(rgba, new_size, interpolation=cv2.INTER_CUBIC)
     steps.append(f"supersample({factor:.2g}x -> {new_size[0]}x{new_size[1]})")
     return upscaled, factor
+
+
+def _clamp_border(rgba: np.ndarray) -> np.ndarray:
+    """Overwrite the outermost pixel ring with its inward neighbour.
+
+    A resampled or lossily-compressed image has a half-blended outermost row
+    and column: the resampler had nothing beyond the canvas to average with, so
+    the edge pixels end up a colour that appears nowhere else in the artwork.
+    Quantization then either spends a cluster on that colour or snaps it to the
+    nearest one, and either way the tracer wraps a one-pixel path around the
+    whole canvas - hundreds of nodes describing an artifact of the crop.
+    """
+    if rgba.shape[0] < 3 or rgba.shape[1] < 3:
+        return rgba
+    result = rgba.copy()
+    result[0] = result[1]
+    result[-1] = result[-2]
+    result[:, 0] = result[:, 1]
+    result[:, -1] = result[:, -2]
+    return result
 
 
 def _jpeg_cleanup(rgba: np.ndarray) -> np.ndarray:
@@ -331,6 +388,108 @@ def _merge_close_centers(
     return centers[survivors], compact[remap][labels]
 
 
+def _assign(samples: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    """Nearest-centre assignment for every sample, in memory-bounded chunks."""
+    assigned = np.empty(samples.shape[0], dtype=np.int32)
+    for start in range(0, samples.shape[0], _ASSIGN_CHUNK):
+        chunk = samples[start : start + _ASSIGN_CHUNK]
+        distances = ((chunk[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
+        assigned[start : start + _ASSIGN_CHUNK] = distances.argmin(axis=1)
+    return assigned
+
+
+def _segment_offset(point: np.ndarray, start: np.ndarray, end: np.ndarray) -> float:
+    """Distance from ``point`` to the middle stretch of the ``start``-``end``
+    segment, or infinity if it projects outside it. A colour sitting beyond an
+    endpoint is darker or lighter than both parents, so it is not their blend.
+    """
+    span = end - start
+    length_sq = float(span @ span)
+    if length_sq <= 0:
+        return float("inf")
+    t = float((point - start) @ span) / length_sq
+    if not 0.15 <= t <= 0.85:
+        return float("inf")
+    return float(np.linalg.norm(point - (start + t * span)))
+
+
+# Share of a region that must survive erosion for it to count as a real area of
+# artwork rather than a band hugging a boundary.
+_BLEND_CORE_SHARE = 0.15
+
+
+def _blend_centers(
+    centers: np.ndarray,
+    label_map: np.ndarray,
+    *,
+    max_share: float,
+    max_offset: float,
+    erode_px: int,
+    dominance: float = 3.0,
+) -> np.ndarray:
+    """Indices of palette entries that are only the blend of two real colours.
+
+    Anti-aliasing between two flat regions leaves a band of intermediate
+    pixels, and k-means will spend a cluster on it: on dark-on-white artwork it
+    lands a muddy grey between the ink and the paper. The band is a legitimate
+    region - those pixels really are that colour - so neither
+    _merge_close_centers (it sits far from both parents) nor boundary smoothing
+    (which would only tidy its edges) removes it. It survives into the SVG as a
+    halo hugging every stroke, in a colour the artwork never contained, and it
+    costs a cluster the real colours needed.
+
+    Colour geometry alone cannot identify one. Measured on a sticker whose
+    trees are pale blue: the halo sat 3.5 off the line between its parents and
+    the pale blue sat 8.9 off the line between *its* neighbours, so every
+    threshold that caught the halo flattened the trees to white first. Being
+    "between two other colours" is simply not rare.
+
+    What does separate them is shape. A blend only ever exists along a
+    boundary, so it is thin everywhere and erosion erases it; a real colour
+    occupies area and keeps a core. Both tests have to pass: collinear *and*
+    thin, with far fewer pixels than either parent.
+    """
+    count = centers.shape[0]
+    if count < 3:
+        return np.empty(0, dtype=np.int32)
+
+    populations = np.bincount(
+        label_map[label_map >= 0].ravel(), minlength=count
+    ).astype(np.float64)
+    total = populations.sum()
+    if total <= 0:
+        return np.empty(0, dtype=np.int32)
+
+    points = centers.astype(np.float32)
+    size = 2 * max(1, erode_px) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+    doomed = []
+    for index in range(count):
+        if populations[index] / total > max_share:
+            continue
+        parents = [
+            other
+            for other in range(count)
+            if other != index
+            and populations[other] >= populations[index] * dominance
+        ]
+        collinear = any(
+            _segment_offset(points[index], points[a], points[b]) <= max_offset
+            for position, a in enumerate(parents)
+            for b in parents[position + 1 :]
+        )
+        if not collinear:
+            continue
+
+        mask = (label_map == index).astype(np.uint8)
+        core = int(cv2.erode(mask, kernel).sum())
+        if core <= populations[index] * _BLEND_CORE_SHARE:
+            doomed.append(index)
+
+    return np.array(doomed, dtype=np.int32)
+
+
 def _smooth_labels(
     labels: np.ndarray, cluster_count: int, sigma: float
 ) -> np.ndarray:
@@ -361,18 +520,215 @@ def _smooth_labels(
     return winner
 
 
+
+
+# Coverage at which a pixel counts as the solid spine of a stroke, kept even
+# when smoothing would otherwise erase it. Below the obvious 0.75 because a
+# hairline that lands under a pixel wide at tracing resolution peaks around
+# 0.67 - measured on a 2px rule in a 2400px source traced at 2200 - and the
+# whole point of the spine is that such a stroke still survives.
+_INK_SPINE = 0.6
+
+
+def _to_hex(color: np.ndarray) -> str:
+    return "#{:02x}{:02x}{:02x}".format(*(int(c) for c in color[:3]))
+
+
+def _luma(rgb: np.ndarray) -> np.ndarray:
+    """Rec. 601 luma as float32, for any array shaped ``(..., 3)``."""
+    weights = np.array([0.299, 0.587, 0.114], dtype=np.float32)
+    return rgb.astype(np.float32) @ weights
+
+
+def _ink_mask(
+    rgba: np.ndarray, max_luma: int, min_contrast: float, radius: int = 0
+) -> np.ndarray:
+    """Locate the artwork's line work at source resolution.
+
+    A single global luminance cut does not work here, and the reason is worth
+    keeping: a stroke's edge sits at the luminance half way between the ink and
+    whatever it is drawn against, and that midpoint is different for every
+    neighbour. Measured on sticker artwork - ink at luma 45, white 253, brown
+    107 - the true edge is at 149 against the white and at 76 against the
+    brown. One threshold at 100 therefore reads the same stroke as too thin
+    against the paper and too fat against the brown, which is the stroke width
+    pulsing along its length.
+
+    So the cut is taken locally instead. Dilating and eroding the luminance
+    gives the lightest and darkest value within a stroke's reach of each pixel;
+    a pixel is ink when it falls in the darker half of *that* range. Two gates
+    keep it honest: the local minimum has to be dark enough to be ink at all
+    (so a brown-to-salmon boundary is not mistaken for a stroke), and the local
+    range has to be wide enough to be a real edge rather than noise in a flat
+    region.
+    """
+    luma = _luma(rgba[..., :3])
+    # The window has to reach across the stroke to the fills on either side,
+    # and no further. Too wide and it finds some *other*, lighter colour
+    # nearby, which drags the midpoint up until the fill next to the stroke
+    # falls below it and gets swallowed - the stroke comes back too heavy.
+    radius = radius or max(2, round(max(luma.shape) / 800))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
+    )
+    lightest = cv2.dilate(luma, kernel)
+    darkest = cv2.erode(luma, kernel)
+
+    stroke = (
+        (darkest <= max_luma)
+        & ((lightest - darkest) >= min_contrast)
+        & (luma <= (lightest + darkest) * 0.5)
+    )
+    # A plain cut at the same level, kept alongside. The contrast gate above
+    # blinds the stroke mask to the *inside* of a wide dark shape - the window
+    # never reaches anything lighter, so only a fringe a couple of pixels deep
+    # survives. That fringe is indistinguishable from a hairline by shape
+    # alone, so the "is this thick enough to leave alone" test in
+    # _restore_linework needs the whole dark region, not the fringe.
+    dark = luma <= max_luma
+
+    if rgba.shape[2] == 4:
+        opaque = rgba[..., 3] >= 128
+        stroke &= opaque
+        dark &= opaque
+    return stroke, dark
+
+
+def _ink_coverage(
+    ink: np.ndarray, size: tuple[int, int], sigma: float, threshold: float
+) -> np.ndarray:
+    """Resample the ink mask to ``size`` and re-threshold it into a clean mask.
+
+    Two things have to happen here or the restored stroke is worse than no
+    stroke at all.
+
+    *Resampling.* INTER_AREA reports the fraction of the destination pixel a
+    stroke covers, which is exactly what a hairline needs - but only when
+    downscaling. OpenCV falls back to nearest-neighbour when asked to enlarge
+    with it, so at the usual settings (1600px source, 1100px working size, 2x
+    supersample = 2200px traced) the mask was being blown up 1.375x with no
+    interpolation at all. Every stroke edge arrived at the tracer as a blocky
+    1.4px staircase, which is the visible sawtooth on VTracer's output and the
+    lumpy, width-varying stroke on Potrace's.
+
+    *Smoothing.* Every other region boundary in the image has been through the
+    majority vote in _smooth_labels by this point; the restored stroke has not,
+    so it alone still carries pixel-level wobble. Blurring the coverage field
+    and re-thresholding is the equivalent operation for a binary mask: it moves
+    the edge to the sub-pixel position the coverage implies instead of snapping
+    it to the pixel grid, and it cannot introduce a colour.
+
+    The threshold sits below 0.5 on purpose. Blurring a stroke only a few
+    pixels wide pulls its centre value down, so cutting at 0.5 would thin the
+    thinnest strokes back out of existence - the exact failure being fixed.
+    """
+    height, width = ink.shape
+    if (width, height) != size:
+        interpolation = cv2.INTER_AREA if size[0] < width else cv2.INTER_LINEAR
+        coverage = cv2.resize(
+            ink.astype(np.float32), size, interpolation=interpolation
+        )
+    else:
+        coverage = ink.astype(np.float32)
+
+    if sigma <= 0:
+        return coverage >= threshold
+
+    kernel = int(sigma * 6) | 1
+    blurred = cv2.GaussianBlur(coverage, (kernel, kernel), sigma)
+    # Smoothing may refine a stroke's edge; it must never delete the stroke. A
+    # rule thinner than one pixel at tracing resolution has its peak pulled
+    # below any sensible threshold by the blur and simply disappears - which is
+    # the original bug, reintroduced by its own fix. Pixels the resample says
+    # are solidly covered are kept regardless. For a stroke wide enough to
+    # smooth, this spine sits inside the smoothed edge and changes nothing.
+    return (blurred >= threshold) | (coverage >= _INK_SPINE)
+
+
+def _restore_linework(
+    rgba: np.ndarray,
+    ink: np.ndarray,
+    dark: np.ndarray | None,
+    palette: np.ndarray,
+    max_luma: int,
+    *,
+    sigma: float,
+    threshold: float,
+    max_width: float,
+) -> tuple[np.ndarray, int]:
+    """Stamp line work the pipeline lost back onto the quantized image.
+
+    Only pixels that were ink in the source *and* no longer carry any dark
+    palette entry are touched, so solid dark regions keep whichever dark entry
+    quantization gave them. The stamp always reuses an existing palette entry,
+    so this can never introduce a colour - and therefore never an extra traced
+    layer - that quantization did not already produce.
+
+    Restricted to *thin* ink, and that restriction is load-bearing. A dark
+    shape wide enough to survive the pipeline on its own has already had its
+    boundary smoothed by the majority vote in _smooth_labels; stamping the raw
+    source mask back over it throws that away and reinstates the very pixel
+    wobble smoothing exists to remove. Measured on noisy concentric rings,
+    restoring everything made boundary smoothing a no-op - identical segment
+    counts with it on and off. A morphological opening removes exactly the
+    structures narrower than the kernel while leaving wider ones alone, so
+    subtracting it isolates the strokes that actually need rescuing.
+    """
+    height, width = rgba.shape[:2]
+
+    if max_width > 0 and dark is not None:
+        # The threshold is in traced pixels; the masks are at source resolution.
+        scale = width / ink.shape[1]
+        radius = max(1, round(max_width / (2 * scale)))
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
+        )
+        # Opening keeps only what is wider than the kernel. Dilating the result
+        # back out covers the fringe of those wide shapes, which is the part
+        # the stroke mask actually holds.
+        thick = cv2.morphologyEx(dark.astype(np.uint8), cv2.MORPH_OPEN, kernel)
+        ink = ink & (cv2.dilate(thick, kernel) == 0)
+
+    if ink.shape != (height, width) or sigma > 0:
+        ink = _ink_coverage(ink, (width, height), sigma, threshold)
+
+    luma = _luma(palette)
+    dark = np.flatnonzero(luma <= max_luma)
+    if dark.size == 0:
+        # Nothing dark survived quantization. Stamping here would have to invent
+        # a colour, which is exactly the extra-layer problem this avoids.
+        return rgba, 0
+
+    result = rgba.copy()
+    rgb = result[..., :3]
+
+    already_dark = np.zeros((height, width), dtype=bool)
+    for index in dark:
+        already_dark |= np.all(rgb == palette[index], axis=-1)
+
+    lost = ink & ~already_dark
+    if result.shape[2] == 4:
+        lost &= result[..., 3] > 0
+    if not lost.any():
+        return rgba, 0
+
+    rgb[lost] = palette[dark[int(np.argmin(luma[dark]))]]
+    return result, int(lost.sum())
+
+
 def _quantize(
     rgba: np.ndarray,
     params: PreprocessParams,
     analysis: ImageAnalysis,
     supersample: float = 1.0,
-) -> tuple[np.ndarray, int, float]:
+) -> tuple[np.ndarray, int, float, np.ndarray | None]:
     """k-means colour quantization over the visible pixels only.
 
     Transparent pixels are excluded from clustering so a large removed
     background cannot steal a cluster centre from the actual artwork.
 
-    Returns ``(image, k, applied_sigma)``.
+    Returns ``(image, k, applied_sigma, palette)``, where ``palette`` is the
+    exact uint8 colours written into the image.
     """
     k = (
         _auto_k(analysis, params)
@@ -387,7 +743,7 @@ def _quantize(
 
     samples = rgb[visible_mask].astype(np.float32)
     if samples.shape[0] < k:
-        return result, 0, 0.0
+        return result, 0, 0.0, None
 
     # --- fit centres on a subsample ---------------------------------------
     if samples.shape[0] > _KMEANS_FIT_SAMPLES:
@@ -411,11 +767,7 @@ def _quantize(
     centers = np.clip(centers, 0, 255).astype(np.float32)
 
     # --- assign every pixel to its nearest centre -------------------------
-    assigned = np.empty(samples.shape[0], dtype=np.int32)
-    for start in range(0, samples.shape[0], _ASSIGN_CHUNK):
-        chunk = samples[start : start + _ASSIGN_CHUNK]
-        distances = ((chunk[:, None, :] - centers[None, :, :]) ** 2).sum(axis=2)
-        assigned[start : start + _ASSIGN_CHUNK] = distances.argmin(axis=1)
+    assigned = _assign(samples, centers)
 
     # --- collapse near-duplicate palette entries --------------------------
     # Do this before smoothing: the halo bands are legitimate regions, so
@@ -423,7 +775,39 @@ def _quantize(
     centers, assigned = _merge_close_centers(
         centers, assigned, params.min_color_separation
     )
+
+    # --- drop anti-aliasing blends ----------------------------------------
+    if params.drop_blend_colors:
+        label_map = np.full(result.shape[:2], -1, dtype=np.int32)
+        label_map[visible_mask] = assigned
+        doomed = _blend_centers(
+            centers,
+            label_map,
+            max_share=params.blend_max_share,
+            max_offset=params.blend_max_offset,
+            # A halo is as wide as the anti-aliasing ramp the tracer sees, so
+            # it grows with the supersample factor and the test has to grow
+            # with it.
+            erode_px=max(1, round(1.5 * supersample)),
+        )
+        if doomed.size and centers.shape[0] - doomed.size >= 2:
+            kept = np.setdiff1d(np.arange(centers.shape[0]), doomed)
+            log.info(
+                "Dropped %d blend colour(s): %s",
+                doomed.size,
+                ", ".join(_to_hex(centers[i].astype(np.uint8)) for i in doomed),
+            )
+            centers = centers[kept]
+            # Re-assign from the original colours rather than remapping labels:
+            # each pixel of the band then lands on whichever parent it was
+            # actually nearer, which is what splitting an anti-aliased edge
+            # means. Remapping wholesale would shift the whole band one way.
+            assigned = _assign(samples, centers)
+
     effective_k = int(centers.shape[0])
+    # Write through the uint8 palette rather than converting per assignment, so
+    # the colours reported back are byte-identical to the ones in the image.
+    palette = centers.astype(np.uint8)
 
     # --- optional boundary smoothing --------------------------------------
     # Sigma is specified in output pixels, so scale it to the traced
@@ -452,13 +836,13 @@ def _quantize(
         smoothed = _smooth_labels(label_map, classes, applied_sigma)
         # Never let smoothing resurrect pixels that were made transparent.
         smoothed_visible = visible_mask & (smoothed < effective_k)
-        rgb[smoothed_visible] = centers[smoothed[smoothed_visible]].astype(np.uint8)
+        rgb[smoothed_visible] = palette[smoothed[smoothed_visible]]
         result[..., :3] = rgb
-        return result, effective_k, applied_sigma
+        return result, effective_k, applied_sigma, palette
 
-    rgb[visible_mask] = centers[assigned].astype(np.uint8)
+    rgb[visible_mask] = palette[assigned]
     result[..., :3] = rgb
-    return result, effective_k, 0.0
+    return result, effective_k, 0.0, palette
 
 
 def _binarize(rgba: np.ndarray, params: PreprocessParams) -> np.ndarray:

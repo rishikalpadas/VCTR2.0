@@ -30,7 +30,9 @@ from errors import (  # noqa: E402
     UnsupportedFormatError,
 )
 import pathstats  # noqa: E402
-from presets import get_preset  # noqa: E402
+from image_io import load_image  # noqa: E402
+from preprocessing import preprocess  # noqa: E402
+from presets import apply_overrides, get_preset  # noqa: E402
 from svg_export import (  # noqa: E402
     MAX_SVG_BYTES,
     _count_curve_operators,
@@ -605,9 +607,231 @@ class TestOverrides(unittest.TestCase):
         outcome = vectorize_bytes(
             png_bytes(donut()),
             preset_name="flat_art",
-            overrides={"quantize_colors": 5},
+            # An explicit k is the cluster count, not a guarantee about the
+            # surviving palette: the blend filter runs afterwards and removes
+            # entries that are only the average of two others, which on a
+            # two-colour donut is exactly what the surplus clusters land on.
+            # Disabled here so this keeps testing the override itself.
+            overrides={"quantize_colors": 5, "drop_blend_colors": False},
         )
         self.assertIn("quantize(k=5)", outcome.meta["preprocess_steps"])
+
+    def test_surplus_clusters_are_dropped_as_blends(self):
+        """Asking for more colours than the artwork has must not invent any:
+        the extra clusters land on anti-aliased edges, and those are averages
+        of two real colours, not colours of their own."""
+        outcome = vectorize_bytes(
+            png_bytes(donut()),
+            preset_name="flat_art",
+            overrides={"quantize_colors": 5},
+        )
+        self.assertNotIn("quantize(k=5)", outcome.meta["preprocess_steps"])
+        self.assertLess(len(outcome.meta["palette"]), 5)
+
+
+KEYLINE_SIZE = 2400
+KEYLINE_RULE_Y = KEYLINE_SIZE - KEYLINE_SIZE // 15
+
+
+def keylined_art() -> Image.Image:
+    """Flat colour rings separated by thin dark keylines, plus a hairline rule.
+
+    Deliberately the shape of real sticker artwork, and deliberately large: the
+    strokes are 2px at 2400px, but the logo preset works at 1100px, so by the
+    time the tracer sees them they are under a pixel wide. Drawn oversized and
+    downsampled so every stroke carries a genuine anti-aliasing ramp - a
+    hard-edged synthetic stroke survives resampling that a real one does not,
+    which is what made an earlier version of this fixture prove nothing.
+    """
+    supersize, stroke = 2, 2
+    canvas = KEYLINE_SIZE * supersize
+    image = Image.new("RGB", (canvas, canvas), (252, 252, 254))
+    draw = ImageDraw.Draw(image)
+    for index, fill in enumerate([(172, 85, 54), (245, 168, 131), (253, 219, 126)]):
+        inset = canvas * (8 + index * 9) // 100
+        draw.ellipse(
+            (inset, inset, canvas - inset, canvas - inset),
+            fill=fill,
+            outline=(40, 40, 40),
+            width=stroke * supersize,
+        )
+    rule_y = KEYLINE_RULE_Y * supersize
+    draw.line(
+        (canvas // 6, rule_y, canvas - canvas // 6, rule_y),
+        fill=(40, 40, 40),
+        width=stroke * supersize,
+    )
+    return image.resize((KEYLINE_SIZE, KEYLINE_SIZE), Image.LANCZOS)
+
+
+class TestLinework(unittest.TestCase):
+    """Thin dark strokes must survive the downscale-and-smooth pipeline."""
+
+    @staticmethod
+    def prepare(image: Image.Image, **overrides):
+        rgba, info = load_image(png_bytes(image))
+        preset = apply_overrides(
+            get_preset("logo"), {"background": "never", **overrides}
+        )
+        return preprocess(
+            rgba, preset.preprocess, analyze(rgba), source_format=info["format"]
+        )
+
+    @staticmethod
+    def dark_pixels(rgba: np.ndarray) -> int:
+        luma = rgba[..., :3].astype(np.float32) @ np.array(
+            [0.299, 0.587, 0.114], dtype=np.float32
+        )
+        return int((luma <= 100).sum())
+
+    @staticmethod
+    def darkest_along_rule(prepared) -> float:
+        """Luma of the darkest pixel across the hairline rule.
+
+        The rule is the cleanest witness for the whole class of bug: it is dark
+        on white, so when the pipeline loses it the pixels do not disappear,
+        they get reassigned to the nearest surviving palette entry - which is a
+        pale one. A pale reading here is the "the rule came back light blue"
+        report, reduced to a number.
+        """
+        y = round(KEYLINE_RULE_Y * prepared.scale)
+        x = round(KEYLINE_SIZE * 0.5 * prepared.scale)
+        band = prepared.image[y - 6 : y + 7, x - 40 : x + 41, :3].astype(np.float32)
+        return float((band @ np.array([0.299, 0.587, 0.114], np.float32)).min())
+
+    def test_keylines_survive_the_downscale(self):
+        art = keylined_art()
+        without = self.prepare(art, preserve_linework=False)
+        with_ink = self.prepare(art, preserve_linework=True)
+
+        self.assertIn("linework_restored", " ".join(with_ink.steps))
+        self.assertGreater(
+            self.dark_pixels(with_ink.image), self.dark_pixels(without.image) * 1.4
+        )
+
+    def test_hairline_rule_keeps_its_colour(self):
+        art = keylined_art()
+        # Without the fix the rule survives geometrically but lands on a pale
+        # palette entry; with it, ink stays ink.
+        self.assertGreater(
+            self.darkest_along_rule(self.prepare(art, preserve_linework=False)), 120
+        )
+        self.assertLess(
+            self.darkest_along_rule(self.prepare(art, preserve_linework=True)), 100
+        )
+
+    @staticmethod
+    def ring(width: int, size: int = 900) -> Image.Image:
+        image = Image.new("RGB", (size, size), (250, 250, 252))
+        draw = ImageDraw.Draw(image)
+        draw.ellipse(
+            (120, 120, size - 120, size - 120), outline=(40, 40, 40), width=width
+        )
+        return image
+
+    def test_thick_dark_shapes_are_left_to_the_smoother(self):
+        """Only strokes thin enough to be lost get stamped back.
+
+        A dark shape wide enough to survive quantization has already had its
+        boundary smoothed by the majority vote; stamping the raw source mask
+        over it reinstates exactly the pixel wobble that smoothing removed.
+        When this broke, boundary smoothing became a no-op on dark artwork -
+        identical segment counts with it on and off.
+        """
+        thin = self.prepare(self.ring(3), preserve_linework=True)
+        thick = self.prepare(self.ring(24), preserve_linework=True)
+        self.assertIn("linework_restored", " ".join(thin.steps))
+        self.assertNotIn("linework_restored", " ".join(thick.steps))
+
+    def test_potrace_paints_the_ink_layer_last(self):
+        """Line work has to win the seam it shares with every fill.
+
+        Each colour layer is traced independently, so a shared boundary comes
+        back as two slightly different curves and whichever is painted later
+        wins. With the ink painted first, every fill bulged into it by however
+        much its own curve fit happened to differ - the stroke reads thinner in
+        some places, and the fill that ate it shows as colour inside the stroke.
+        """
+        outcome = vectorize_bytes(
+            png_bytes(keylined_art()),
+            preset_name="logo",
+            overrides={"background": "never", "engine": "potrace"},
+        )
+        order = [layer["color"] for layer in outcome.meta["engine_meta"]["layers"]]
+        luma = lambda h: (  # noqa: E731
+            0.299 * int(h[1:3], 16) + 0.587 * int(h[3:5], 16) + 0.114 * int(h[5:7], 16)
+        )
+        self.assertGreater(len(order), 1)
+        self.assertEqual(order[-1], min(order, key=luma), f"paint order {order}")
+
+    def test_restored_ink_stays_on_the_palette(self):
+        """Stamping must not introduce a colour, or it becomes an extra layer."""
+        prepared = self.prepare(keylined_art(), preserve_linework=True)
+        visible = prepared.image[prepared.image[..., 3] > 0][:, :3]
+        present = {"#{:02x}{:02x}{:02x}".format(*map(int, c)) for c in np.unique(visible, axis=0)}
+        self.assertTrue(present <= set(prepared.palette), present - set(prepared.palette))
+
+
+def small_pale_region(size: int = 1200) -> Image.Image:
+    """White field, a big blue block, and a small pale-blue shape inside it.
+
+    The pale blue is a real colour of the artwork, but it is small and sits
+    almost exactly on the line between the white and the blue in RGB - which is
+    what an anti-aliasing blend between those two looks like as well. Measured
+    on real sticker artwork, the pale blue was *more* collinear than the actual
+    halo, so a colour-geometry test alone flattens it to white.
+    """
+    image = Image.new("RGB", (size, size), (252, 253, 254))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle(
+        (size // 8, size // 8, size * 7 // 8, size * 7 // 8), fill=(77, 147, 196)
+    )
+    draw.rectangle(
+        (size * 2 // 5, size * 2 // 5, size * 3 // 5, size * 3 // 5),
+        fill=(209, 229, 231),
+    )
+    return image
+
+
+class TestBlendColours(unittest.TestCase):
+    def test_a_small_real_colour_is_not_mistaken_for_a_blend(self):
+        outcome = vectorize_bytes(
+            png_bytes(small_pale_region()),
+            preset_name="flat_art",
+            overrides={"background": "never"},
+        )
+        wanted = np.array([209, 229, 231], dtype=np.float32)
+        closest = min(
+            np.linalg.norm(
+                np.array([int(entry[i : i + 2], 16) for i in (1, 3, 5)], np.float32)
+                - wanted
+            )
+            for entry in outcome.meta["palette"]
+        )
+        self.assertLess(closest, 25, f"pale blue lost; palette {outcome.meta['palette']}")
+
+
+class TestPaletteIsClosed(unittest.TestCase):
+    def test_every_fill_comes_from_the_quantized_palette(self):
+        """VTracer averages each layer's colour, so one yellow in the artwork
+        comes back as four near-identical yellows unless they are snapped."""
+        outcome = vectorize_bytes(
+            png_bytes(keylined_art()),
+            preset_name="flat_art",
+            overrides={"background": "never", "engine": "vtracer"},
+        )
+        palette = set(outcome.meta["palette"])
+        fills = {f.lower() for f in re.findall(r'fill="(#[0-9a-fA-F]{6})"', outcome.svg)}
+        self.assertTrue(fills - palette == set(), f"off-palette fills: {fills - palette}")
+
+    def test_snapping_is_skipped_when_there_is_no_palette(self):
+        outcome = vectorize_bytes(
+            png_bytes(donut()),
+            preset_name="flat_art",
+            overrides={"quantize_colors": None},
+        )
+        self.assertIsNone(outcome.meta["palette"])
+        self.assertEqual(outcome.meta["snapped_fills"], 0)
 
 
 class TestPresets(unittest.TestCase):

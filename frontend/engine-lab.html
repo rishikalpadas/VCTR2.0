@@ -40,7 +40,7 @@
   }
 
   /* Deep zoom re-renders the SVG at every level instead of stretching a
-     bitmap - see registerZoomPort() in potrace-test.js. The stage is sized
+     bitmap - see registerZoomPort() in engine-lab.js. The stage is sized
      as a percentage of the viewport and translated for panning; nothing is
      ever resampled, so edges stay sharp all the way to the zoom cap. */
   .canvas.zoomport {
@@ -269,6 +269,6 @@
   <p>Diagnostic page — not linked from the main app. Calls the same <code>/api/vectorize</code> endpoint twice per run, once per engine.</p>
 </div>
 
-<script src="potrace-test.js"></script>
+<script src="engine-lab.js"></script>
 </body>
 </html>

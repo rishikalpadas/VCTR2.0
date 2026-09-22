@@ -52,6 +52,7 @@ class OptimizeResult:
     bytes_before: int
     bytes_after: int
     warnings: list[str]
+    snapped_fills: int = 0
 
 
 def finalize_svg(
@@ -62,6 +63,7 @@ def finalize_svg(
     original_width: int,
     original_height: int,
     params: OptimizeParams,
+    palette: list[str] | None = None,
 ) -> OptimizeResult:
     bytes_before = len(raw_svg.encode("utf-8"))
     warnings: list[str] = []
@@ -81,6 +83,8 @@ def finalize_svg(
         canvas_height=processed_height,
         min_ratio=params.min_path_diagonal_ratio,
     )
+
+    snapped = _snap_fills(root, palette) if palette else 0
 
     _normalize_root(
         root,
@@ -106,11 +110,13 @@ def finalize_svg(
         bytes_before=bytes_before,
         bytes_after=len(svg.encode("utf-8")),
         warnings=warnings,
+        snapped_fills=snapped,
     )
     log.info(
-        "SVG finalized: %d paths (%d culled), %.1f KB -> %.1f KB",
+        "SVG finalized: %d paths (%d culled, %d fills snapped), %.1f KB -> %.1f KB",
         result.path_count,
         result.removed_paths,
+        result.snapped_fills,
         result.bytes_before / 1024,
         result.bytes_after / 1024,
     )
@@ -206,6 +212,67 @@ def _cull_tiny_paths(
             removed += 1
 
     return removed
+
+
+def _parse_hex(value: str) -> tuple[int, int, int] | None:
+    text = value.strip()
+    if not text.startswith("#"):
+        return None
+    digits = text[1:]
+    if len(digits) == 3:
+        digits = "".join(c * 2 for c in digits)
+    if len(digits) != 6:
+        return None
+    try:
+        return int(digits[0:2], 16), int(digits[2:4], 16), int(digits[4:6], 16)
+    except ValueError:
+        return None
+
+
+def _snap_fills(root: ET.Element, palette: list[str]) -> int:
+    """Force every fill onto the palette quantization already decided.
+
+    VTracer derives a layer's colour by averaging the pixels it covers, so even
+    a perfectly flat input comes back one or two units off per layer: one
+    yellow in the artwork becomes #FCDA7D, #FCD97E, #FBD97D and #FAD77E. They
+    read as a single colour but behave as four - "select same fill",
+    recolouring and mapping to spot inks all break, and the layer list in
+    Illustrator fills with duplicates. The averaged edge colours (a muddy grey
+    between black and white, a dusty pink between brown and salmon) land on
+    their nearest real neighbour by the same rule.
+
+    Nearest-neighbour with no distance cap is correct here rather than lax: the
+    traced image contains *only* palette colours, so anything else in the
+    output is an averaging artifact, however far from its neighbours it drifted.
+
+    No-op for Potrace, which already labels each layer with its exact palette
+    colour - which makes this a cheap invariant for both engines.
+    """
+    targets = [(rgb, entry) for entry in palette if (rgb := _parse_hex(entry))]
+    if not targets:
+        return 0
+
+    resolved: dict[str, str] = {}
+    changed = 0
+    for element in root.iter():
+        value = element.get("fill")
+        if not value or value in ("none", "transparent"):
+            continue
+        if value not in resolved:
+            rgb = _parse_hex(value)
+            resolved[value] = (
+                value
+                if rgb is None
+                else min(
+                    targets,
+                    key=lambda t: sum((a - b) ** 2 for a, b in zip(t[0], rgb)),
+                )[1]
+            )
+        if resolved[value] != value:
+            element.set("fill", resolved[value])
+            changed += 1
+
+    return changed
 
 
 def _run_scour(svg: str, params: OptimizeParams) -> tuple[str, str | None]:

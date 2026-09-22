@@ -118,6 +118,7 @@ def vectorize_bytes(
         original_width=info["original_width"],
         original_height=info["original_height"],
         params=preset.optimize,
+        palette=prepared.palette,
     )
     warnings.extend(optimized.warnings)
 
@@ -143,6 +144,8 @@ def vectorize_bytes(
         "supersample": round(prepared.supersample, 3),
         "path_count": optimized.path_count,
         "culled_paths": optimized.removed_paths,
+        "snapped_fills": optimized.snapped_fills,
+        "palette": prepared.palette,
         "svg_bytes": optimized.bytes_after,
         "svg_bytes_before_optimize": optimized.bytes_before,
         "size_reduction_pct": (

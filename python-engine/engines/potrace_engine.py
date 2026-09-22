@@ -239,6 +239,8 @@ def _extract_color_layers(
         lightest = int(np.argmax(brightness))
         order = [i for i in order if i != lightest]
 
+    order = _ink_on_top(order, colors)
+
     layers = []
     for idx in order:
         idx = int(idx)
@@ -249,6 +251,32 @@ def _extract_color_layers(
         hex_color = "#{:02x}{:02x}{:02x}".format(*[int(c) for c in colors[idx]])
         layers.append((hex_color, mask))
     return layers
+
+
+def _ink_on_top(order, colors: np.ndarray) -> list[int]:
+    """Move the darkest colour to the end of the paint order.
+
+    Every layer is traced independently, so the boundary two regions share
+    comes back as two slightly different curves. Wherever they disagree the
+    layer painted later wins the seam. With the darkest layer painted first -
+    which is where sorting by area puts it, since on a dark background it is
+    also the largest - every fill in the artwork gets to bulge into the line
+    work by whatever fraction of a pixel its own curve fit happened to land
+    on. The stroke then reads thinner in some places than others, and the fill
+    that ate it shows up as colour inside the stroke corridor. Both are the
+    same defect, and both are what "the dark lines are not consistent" looks
+    like.
+
+    Painting the ink last is also what the artwork means: in flat vector art
+    the line work sits on top. It is safe to reorder because the masks are
+    disjoint by construction - a layer can only ever win a seam a pixel wide,
+    never cover another region.
+    """
+    if len(order) < 2:
+        return [int(i) for i in order]
+    luma = colors.astype(np.float32) @ np.array([0.299, 0.587, 0.114], np.float32)
+    darkest = int(np.argmin(luma))
+    return [int(i) for i in order if int(i) != darkest] + [darkest]
 
 
 def _requantize(

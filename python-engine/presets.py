@@ -192,6 +192,26 @@ class PreprocessParams:
     # genuinely close colours in the artwork are being fused.
     min_color_separation: float = 26.0
 
+    # Drop palette entries that are only the blend of two other entries.
+    #
+    # min_color_separation above catches clusters that landed *next to* a real
+    # colour. This catches the other failure: a cluster that landed exactly
+    # between two of them, which is what an anti-aliased edge between two flat
+    # regions looks like to k-means. On dark-on-white artwork that is a muddy
+    # grey-brown, far enough from both parents to survive every other filter,
+    # and it becomes a halo traced around every stroke in a colour the artwork
+    # never had - while costing a cluster the real colours needed.
+    #
+    # Only safe on genuinely flat artwork. Leave off for anything with real
+    # gradients or shading, where an intermediate tone is the point.
+    drop_blend_colors: bool = False
+    # A blend never covers much of the canvas; above this share of visible
+    # pixels an intermediate colour is treated as real artwork.
+    blend_max_share: float = 0.06
+    # How far off the line between its two parents a colour may sit and still
+    # count as their blend.
+    blend_max_offset: float = 24.0
+
     # Majority-vote smoothing of the quantized colour regions, in OUTPUT
     # pixels (scaled internally by the supersample factor).
     #
@@ -212,6 +232,64 @@ class PreprocessParams:
     # a ~2% RMSE cost, which is the trade you want on curved artwork. Past ~1.5
     # it starts rounding genuine detail and RMSE turns sharply worse.
     boundary_smooth_sigma: float = 0.0
+
+    # Preserve thin dark line work through the pipeline.
+    #
+    # Keylines in flat artwork are 2-4px in the source and are the first thing
+    # this pipeline destroys. The downscale to max_dimension averages them into
+    # their neighbours, and boundary_smooth_sigma's majority vote then loses
+    # what is left to the two large regions either side. The stroke does not
+    # degrade gracefully - it either vanishes (a dark line between two mid-tone
+    # fills snaps to one of them) or changes colour outright (a dark rule on
+    # white snaps to whatever pale palette entry is nearest). A sticker coming
+    # back with every keyline gone and the rule under its wordmark rendered in
+    # pale blue is one bug, not two.
+    #
+    # When on, dark pixels are recorded at *source* resolution before any
+    # resampling and stamped back after quantization, always reusing an
+    # existing palette entry so no new colour - and so no new traced layer -
+    # can appear. Only has an effect when quantization is on, since there is no
+    # palette to stamp from otherwise.
+    preserve_linework: bool = False
+    # How dark the darkest pixel in a neighbourhood must be for that
+    # neighbourhood to contain line work at all. Gates the *local minimum*, not
+    # each pixel, so it only has to separate the ink from the darkest fill in
+    # the artwork - 100 clears a mid-brown (~107) while catching black ink
+    # (~45). The stroke's actual edge is found by local contrast; see _ink_mask.
+    linework_max_luma: int = 100
+    # Minimum luminance range in a neighbourhood before it is treated as an
+    # edge rather than noise inside a flat region.
+    linework_min_contrast: float = 40.0
+    # Widest stroke, in TRACING-resolution pixels, that still counts as line
+    # work needing rescue. Anything wider survives quantization on its own and
+    # has already had its boundary smoothed; re-stamping it would undo that.
+    #
+    # Measured in traced pixels rather than output pixels (the convention the
+    # sigmas above use) because that is the resolution the stroke has to
+    # survive at, and _restore_linework can convert it to source pixels from
+    # the scale it already knows.
+    linework_max_width: float = 6.0
+    # Smoothing of the restored stroke's edge, in OUTPUT pixels (scaled
+    # internally by the supersample factor), matching boundary_smooth_sigma.
+    #
+    # Needed because the restored stroke is the one boundary in the image that
+    # never went through the majority vote in _smooth_labels - it is stamped on
+    # afterwards. Without this it reaches the tracer carrying raw pixel wobble,
+    # and the tracer faithfully reproduces it: VTracer as a visible sawtooth
+    # (measured: 40% of its segments came back as straight lines), Potrace as a
+    # stroke whose width pulses along its length.
+    #
+    # Measured on sticker artwork, sigma 0 -> 0.4: Potrace 5329 -> 3422
+    # segments (117 -> 80 KB) at identical RMSE, VTracer 3439 -> 2171 segments
+    # with straight-line share falling 23% -> 7% and RMSE improving. Past 0.4 it
+    # starts rounding the strokes themselves and both RMSE and segment count get
+    # worse again, so this is a peak and not a "higher is smoother" dial.
+    linework_smooth_sigma: float = 0.4
+    # Share of a destination pixel a stroke must cover to survive. Below 0.5
+    # because blurring a stroke a few pixels wide pulls its centre value down,
+    # and cutting at the nominal half-coverage point would thin the thinnest
+    # strokes back out of existence.
+    linework_coverage: float = 0.4
 
     # Force the image to pure black/white before tracing (line art).
     binarize: bool = False
@@ -306,6 +384,8 @@ PRESETS: dict[str, Preset] = {
             quantize_colors="auto",
             quantize_max_k=10,
             boundary_smooth_sigma=1.1,
+            preserve_linework=True,
+            drop_blend_colors=True,
         ),
         engine_params=VTracerParams(
             filter_speckle=4,
@@ -340,6 +420,8 @@ PRESETS: dict[str, Preset] = {
             quantize_colors="auto",
             quantize_max_k=12,
             boundary_smooth_sigma=1.0,
+            preserve_linework=True,
+            drop_blend_colors=True,
         ),
         engine_params=VTracerParams(
             filter_speckle=8,
@@ -368,6 +450,8 @@ PRESETS: dict[str, Preset] = {
             # couple of pixels across. In practice the adaptive safety factor
             # usually zeroes this for real lettering anyway.
             boundary_smooth_sigma=0.8,
+            preserve_linework=True,
+            drop_blend_colors=True,
         ),
         engine_params=VTracerParams(
             filter_speckle=6,
@@ -525,6 +609,11 @@ _PRE_OVERRIDES = {
     "boundary_smooth_sigma": lambda v: float(min(3.0, max(0.0, float(v)))),
     "min_color_separation": lambda v: float(min(120.0, max(0.0, float(v)))),
     "quantize_colors": _cast_quantize,
+    "preserve_linework": bool,
+    "drop_blend_colors": bool,
+    "linework_max_luma": lambda v: int(min(255, max(0, int(v)))),
+    "linework_smooth_sigma": lambda v: float(min(3.0, max(0.0, float(v)))),
+    "linework_coverage": lambda v: float(min(0.9, max(0.1, float(v)))),
 }
 
 # Keys where an explicit null is a meaningful value ("turn this off") rather
