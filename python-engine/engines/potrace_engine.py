@@ -95,6 +95,9 @@ class PotraceVectorizer(BaseVectorizer):
         layers = _extract_color_layers(
             rgba, max_layers=params.max_layers, skip_lightest=skip_background
         )
+        layers = _tuck_fills_under_ink(
+            layers, reach=params.ink_tuck, speck_area=params.speck_area
+        )
 
         if not layers:
             raise EngineError(
@@ -104,7 +107,6 @@ class PotraceVectorizer(BaseVectorizer):
 
         path_elements: list[str] = []
         layer_meta: list[dict] = []
-        traced: list[tuple[str, list[str]]] = []
 
         with tempfile.TemporaryDirectory(prefix="potrace_") as tmp:
             tmp_dir = Path(tmp)
@@ -146,9 +148,6 @@ class PotraceVectorizer(BaseVectorizer):
                     path_elements.append(f'<path fill="{hex_color}" d="{d}"/>')
                 if ds:
                     layer_meta.append({"color": hex_color, "subpaths": len(ds)})
-                    traced.append((hex_color, ds))
-
-        path_elements = _ink_underlay(traced, params.seam_underlay) + path_elements
 
         if not path_elements:
             raise EngineError(
@@ -283,44 +282,85 @@ def _ink_on_top(order, colors: np.ndarray) -> list[int]:
     return [int(i) for i in order if int(i) != darkest] + [darkest]
 
 
-def _ink_underlay(
-    traced: list[tuple[str, list[str]]], width: float
-) -> list[str]:
-    """Repeat the line work underneath everything, stroked, to back the seams.
+def _tuck_fills_under_ink(
+    layers: list[tuple[str, np.ndarray]], *, reach: float, speck_area: int
+) -> list[tuple[str, np.ndarray]]:
+    """Run every fill on underneath the line work, and fold specks away.
 
-    Every layer's outline is fitted on its own mask, so the edge two regions
-    share comes back as two curves a fraction of a pixel apart. Where both fall
-    inside their own mask the pixels between them are painted by nobody - the
-    neighbour's mask never held them either - and the background shows through
-    as a white sliver along the line work.
+    ``layers`` is in paint order with the ink last (see ``_ink_on_top``).
 
-    Something has to fill that sliver, and the choice of what is the whole
-    problem. The neighbouring fill is the obvious candidate and the wrong one:
-    it also has to grow *into* the stroke corridor to get there, so the sliver
-    turns from white to a bright fringe running alongside every dark line,
-    which is far more visible than the gap it replaced. Widening the strokes
-    until nothing can show through works, but a gap that averages a tenth of a
-    pixel costs two thirds of a pixel of stroke everywhere to cover.
+    Every layer is traced on its own mask, so a fill that stops exactly at the
+    ink comes back with its outline on the stroke's edge - and wherever its
+    curve fit bulges by a fraction of a pixel, the fill pokes out past the
+    stroke into the next region, or falls short and leaves a background
+    sliver. Both read as colour leaking across the line work. Handing each ink
+    pixel to its nearest fill moves every fill outline to the *middle* of the
+    stroke instead, where the ink painted on top covers whatever the fit does.
+    The ink's own mask is untouched, so the strokes keep their traced weight.
 
-    So the line work is emitted twice: once here at the bottom, stroked, where
-    the only part of it that is ever seen is whatever pokes out from under the
-    fills - exactly the slivers - and once on top at its traced width, which is
-    what the strokes actually measure. Reusing the same path data rather than
-    tracing a dilated mask keeps the two copies exactly concentric and saves a
-    potrace pass.
+    ``reach`` bounds how far a fill runs under ink. Past a stroke's half width
+    the extra area is invisible anyway, and without a bound a dark backdrop
+    that quantized onto the ink colour would turn the neighbouring fill into
+    a canvas-sized shape. Transparent pixels take part as their own seed, so a
+    stroke against a removed background is split with nothing rather than
+    growing the fill out past the artwork.
 
-    Measured on the badge artwork: unpainted pixels 3,762 -> 513, and colour
-    inside the stroke corridor 2,489 -> 1,867, with the strokes at 1.02x the
-    weight they trace to.
+    Specks - fill components under ``speck_area`` pixels - are merged into the
+    nearest other fill first. At three-colour junctions quantization strands
+    a few pixels of the wrong colour against the stroke; potrace's own
+    turdsize filter only drops them, which leaves a hole of background.
     """
-    if width <= 0 or len(traced) < 2:
-        return []
-    hex_color, ds = traced[-1]  # _ink_on_top traced the line work last
-    return [
-        f'<path fill="{hex_color}" stroke="{hex_color}" stroke-width="{width:g}" '
-        f'stroke-linejoin="round" stroke-linecap="round" d="{d}"/>'
-        for d in ds
-    ]
+    if len(layers) < 2 or reach <= 0:
+        return layers
+
+    height, width = layers[0][1].shape
+    ink_index = len(layers) - 1
+    label = np.full((height, width), -1, dtype=np.int32)  # -1: transparent
+    for index, (_, mask) in enumerate(layers):
+        label[mask] = index
+
+    if speck_area > 0:
+        for index in range(ink_index):
+            count, components, stats, _ = cv2.connectedComponentsWithStats(
+                (label == index).astype(np.uint8), connectivity=8
+            )
+            small = [c for c in range(1, count) if stats[c, cv2.CC_STAT_AREA] < speck_area]
+            if not small:
+                continue
+            speck = np.isin(components, small)
+            others = (label >= 0) & (label != ink_index) & (label != index)
+            if not others.any():
+                continue
+            nearest, _ = _nearest_seed(others, label)
+            label[speck] = nearest[speck]
+
+    ink = label == ink_index
+    nearest, distance = _nearest_seed(~ink, label)
+    tucked = ink & (distance <= reach) & (nearest >= 0)
+
+    result = []
+    for index, (hex_color, mask) in enumerate(layers[:-1]):
+        grown = (label == index) | (tucked & (nearest == index))
+        if int(grown.sum()) >= _MIN_LAYER_PIXELS:
+            result.append((hex_color, grown))
+    result.append((layers[-1][0], ink))
+    return result
+
+
+def _nearest_seed(
+    seeds: np.ndarray, values: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """For every pixel, ``values`` at the nearest seed pixel and its distance."""
+    distance, labels = cv2.distanceTransformWithLabels(
+        np.where(seeds, 0, 1).astype(np.uint8),
+        cv2.DIST_L2,
+        5,
+        labelType=cv2.DIST_LABEL_PIXEL,
+    )
+    # DIST_LABEL_PIXEL numbers the seed pixels 1..n in raster order.
+    ys, xs = np.nonzero(seeds)
+    lookup = np.concatenate([[-1], values[ys, xs]]).astype(values.dtype)
+    return lookup[labels], distance
 
 
 def _requantize(

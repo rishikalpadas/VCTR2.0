@@ -146,6 +146,11 @@ def preprocess(
             working, dissolved = _dissolve_edge_films(working, palette, pre_quantize)
             if dissolved:
                 steps.append(f"edge_films_dissolved({dissolved:,}px)")
+            working, unblended = _unblend_line_edges(
+                working, palette, pre_quantize, reach=_UNBLEND_REACH * supersample
+            )
+            if unblended:
+                steps.append(f"line_edges_unblended({unblended:,}px)")
 
     if params.binarize:
         working = _binarize(working, params)
@@ -618,6 +623,87 @@ def _dissolve_edge_films(
     result = rgba.copy()
     result[..., :3][visible] = palette[resolved[visible]]
     return result, int((resolved != labels).sum())
+
+
+# How far from the line work, in output pixels, edge pixels are re-examined by
+# _unblend_line_edges. An anti-aliased edge is a pixel or so wide; two covers
+# it after the boundary smoothing has moved it about.
+_UNBLEND_REACH = 2.0
+
+
+def _unblend_line_edges(
+    rgba: np.ndarray, palette: np.ndarray, original: np.ndarray, *, reach: float
+) -> tuple[np.ndarray, int]:
+    """Give anti-aliased stroke edges back to the fill they were blended from.
+
+    A pixel on a stroke's edge is a mix of the ink and the fill it runs over.
+    Nearest-colour quantization compares that mix only against the pure
+    palette entries, so whenever some *third* colour of the artwork sits near
+    the mix, the edge goes to it: a 50/50 blend of #272727 and pale blue
+    #d0e5e6 is nearer the tent's blue #4d91c2 than either parent. On the
+    sticker artwork that ate a notch of blue out of each top corner of a pale
+    pole, where the pole meets a crossbar. _dissolve_edge_films cannot catch it
+    there, because the blue it would have to call a film is a real region a
+    pixel away.
+
+    So each non-ink pixel within ``reach`` of the ink is explained as a blend
+    instead: for every fill present nearby, the best mix of that fill with the
+    ink, scored by how far the pixel's pre-quantization colour sits from it.
+    If some blend explains the pixel better than the colour it was given, it
+    goes to that blend's fill. Edges only ever move between fills, never onto
+    the ink: the boundary smoothing has already placed the stroke edge, and
+    snapping it back to the raw source colours would reinstate the pixel
+    wobble smoothing removed (and add ~8% stroke weight on the keylined test
+    art). The ink itself is never moved either.
+    """
+    rgb = rgba[..., :3]
+    visible = rgba[..., 3] >= 128
+    swatches = palette.astype(np.float32)
+    labels = np.abs(
+        rgb.astype(np.float32)[:, :, None, :] - swatches[None, None, :, :]
+    ).sum(axis=3).argmin(axis=2)
+
+    ink = int(np.argmin(_luma(swatches)))
+    ink_mask = (labels == ink) & visible
+    radius = max(1, round(reach))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
+    )
+    zone = (cv2.dilate(ink_mask.astype(np.uint8), kernel) > 0) & visible & ~ink_mask
+    if not zone.any():
+        return rgba, 0
+
+    ys, xs = np.nonzero(zone)
+    pixels = original[ys, xs].astype(np.float32)
+    current = labels[ys, xs]
+    best_error = np.linalg.norm(pixels - swatches[current], axis=1)
+    best_label = current.copy()
+    ink_color = swatches[ink]
+
+    for index in range(len(palette)):
+        if index == ink:
+            continue
+        # Only fills actually present nearby may claim an edge - a blend must
+        # never invent a colour that is nowhere near the pixel.
+        nearby = cv2.dilate(((labels == index) & visible).astype(np.uint8), kernel)
+        present = nearby[ys, xs] > 0
+        if not present.any():
+            continue
+        direction = ink_color - swatches[index]
+        length_sq = max(float(direction @ direction), 1.0)
+        share = np.clip(((pixels - swatches[index]) @ direction) / length_sq, 0.0, 1.0)
+        error = np.linalg.norm(
+            pixels - (swatches[index] + share[:, None] * direction), axis=1
+        )
+        better = present & (error < best_error)
+        best_error[better] = error[better]
+        best_label[better] = index
+
+    resolved = labels.copy()
+    resolved[ys, xs] = best_label
+    result = rgba.copy()
+    result[..., :3][visible] = palette[resolved[visible]]
+    return result, int((best_label != current).sum())
 
 
 def _to_hex(color: np.ndarray) -> str:

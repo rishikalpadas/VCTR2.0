@@ -31,7 +31,11 @@ from errors import (  # noqa: E402
 )
 import pathstats  # noqa: E402
 from image_io import load_image  # noqa: E402
-from preprocessing import _dissolve_edge_films, preprocess  # noqa: E402
+from preprocessing import (  # noqa: E402
+    _dissolve_edge_films,
+    _unblend_line_edges,
+    preprocess,
+)
 from presets import apply_overrides, get_preset  # noqa: E402
 from svg_export import (  # noqa: E402
     MAX_SVG_BYTES,
@@ -40,7 +44,7 @@ from svg_export import (  # noqa: E402
 )
 from svg_optimizer import validate_svg  # noqa: E402
 from vectorizer import vectorize_bytes  # noqa: E402
-from engines.potrace_engine import _ink_underlay  # noqa: E402
+from engines.potrace_engine import _tuck_fills_under_ink  # noqa: E402
 
 SAMPLES = Path(__file__).resolve().parents[2] / "samples"
 
@@ -836,56 +840,150 @@ class TestEdgeFilms(unittest.TestCase):
             self.assertIn(colour, self.PALETTE.tolist(), f"{colour} is off-palette")
 
 
-class TestLayerSeams(unittest.TestCase):
-    """The underlay that stops the background showing through a shared boundary.
+class TestInkTuck(unittest.TestCase):
+    """Fill layers run on underneath the line work instead of stopping at it.
 
-    Potrace fits every colour layer's outline on its own mask, so the boundary
-    two regions share comes back as two curves a fraction of a pixel apart.
-    Where both fall inside their own mask the pixels between them belong to no
-    layer - the neighbour's mask never held them either - and they render as
-    background: the white slivers that run along the line work.
+    Potrace fits every colour layer's outline on its own mask. A fill that
+    stops exactly at the ink therefore has an outline that lands on the ink's
+    edge, and wherever its curve fit bulges by a fraction of a pixel it pokes
+    out past the stroke - colour leaking into the neighbouring region - or
+    falls short of it, leaving a background sliver. Tucked under the ink, the
+    fill's own outline sits in the middle of the stroke, where the ink painted
+    on top hides whatever its curve fit does.
     """
 
-    TRACED = [("#ff0000", ["M0 0h4v4h-4z"]), ("#272727", ["M1 1h2v2h-2z", "M8 8h1v1z"])]
+    INK = "#272727"
 
-    def test_the_underlay_repeats_the_line_work(self):
-        """The last layer traced is the ink, and it is what backs the seams."""
-        under = _ink_underlay(self.TRACED, 2.0)
-        self.assertEqual(len(under), len(self.TRACED[-1][1]))
-        for element, d in zip(under, self.TRACED[-1][1]):
-            self.assertIn(f'd="{d}"', element)
-            self.assertIn('fill="#272727"', element)
+    @staticmethod
+    def banded(width: int = 40) -> list[tuple[str, np.ndarray]]:
+        """Red | 4px ink stroke | blue, left to right; ink traced last."""
+        red = np.zeros((20, width), bool)
+        blue = np.zeros((20, width), bool)
+        ink = np.zeros((20, width), bool)
+        red[:, :18] = True
+        ink[:, 18:22] = True
+        blue[:, 22:] = True
+        return [("#ff0000", red), ("#0000ff", blue), (TestInkTuck.INK, ink)]
 
-    def test_the_underlay_is_stroked_in_its_own_colour(self):
-        """A fill alone would cover nothing extra - the stroke is the margin."""
-        element = _ink_underlay(self.TRACED, 2.0)[0]
-        self.assertIn('stroke="#272727"', element)
-        self.assertIn('stroke-width="2"', element)
+    def test_fills_split_the_stroke_between_them(self):
+        red, blue, ink = _tuck_fills_under_ink(self.banded(), reach=4, speck_area=0)
+        self.assertTrue(red[1][:, :20].all(), "red stops short of the stroke centre")
+        self.assertTrue(blue[1][:, 20:].all(), "blue stops short of the stroke centre")
+        self.assertFalse((red[1] & blue[1]).any(), "fills overlap each other")
 
-    def test_the_underlay_never_repeats_a_fill(self):
-        """Backing a seam with a colour is what puts a fringe on every stroke."""
-        for element in _ink_underlay(self.TRACED, 2.0):
-            self.assertNotIn("#ff0000", element)
+    def test_the_ink_itself_is_untouched(self):
+        layers = self.banded()
+        tucked = _tuck_fills_under_ink(layers, reach=4, speck_area=0)
+        self.assertEqual(tucked[-1][0], self.INK)
+        np.testing.assert_array_equal(tucked[-1][1], layers[-1][1])
 
-    def test_the_underlay_can_be_switched_off(self):
-        self.assertEqual(_ink_underlay(self.TRACED, 0), [])
+    def test_reach_limits_how_far_a_fill_runs_under_ink(self):
+        """A dark backdrop merged with the ink must not become a giant fill."""
+        red = np.zeros((20, 60), bool)
+        ink = np.ones((20, 60), bool)
+        red[:, :10] = True
+        ink[:, :10] = False
+        tucked = _tuck_fills_under_ink(
+            [("#ff0000", red), (self.INK, ink)], reach=3, speck_area=0
+        )
+        self.assertTrue(tucked[0][1][:, :13].all())
+        self.assertFalse(tucked[0][1][:, 14:].any())
 
-    def test_a_single_layer_needs_no_underlay(self):
-        """Nothing is painted over it, so it has no seam to lose."""
-        self.assertEqual(_ink_underlay(self.TRACED[:1], 2.0), [])
+    def test_transparent_pixels_stay_unfilled(self):
+        """Ink against a removed background splits with nothing, not a fill."""
+        red = np.zeros((20, 40), bool)
+        ink = np.zeros((20, 40), bool)
+        red[:, :18] = True
+        ink[:, 18:22] = True  # everything right of the stroke is transparent
+        tucked = _tuck_fills_under_ink(
+            [("#ff0000", red), (self.INK, ink)], reach=4, speck_area=0
+        )
+        self.assertFalse(tucked[0][1][:, 20:].any(), "fill ran out past the stroke")
 
-    def test_the_underlay_is_painted_first(self):
-        """Painted last it would widen every stroke instead of backing it."""
+    def test_specks_are_merged_into_their_neighbour(self):
+        """A few pixels of purple stranded against a stroke is not artwork."""
+        layers = self.banded()
+        purple = np.zeros((20, 40), bool)
+        purple[8:10, 23:25] = True
+        blue = layers[1][1] & ~purple
+        layers = [layers[0], ("#0000ff", blue), ("#aa66cc", purple), layers[2]]
+        tucked = dict(_tuck_fills_under_ink(layers, reach=4, speck_area=10))
+        self.assertNotIn("#aa66cc", tucked, "the speck survived as its own layer")
+        self.assertTrue(tucked["#0000ff"][8:10, 23:25].all())
+
+    def test_regions_above_the_speck_size_survive(self):
+        layers = self.banded()
+        purple = np.zeros((20, 40), bool)
+        purple[4:12, 26:34] = True
+        layers = [layers[0], ("#0000ff", layers[1][1] & ~purple), ("#aa66cc", purple), layers[2]]
+        tucked = dict(_tuck_fills_under_ink(layers, reach=4, speck_area=10))
+        self.assertTrue(tucked["#aa66cc"][4:12, 26:34].all())
+
+    def test_a_single_layer_is_returned_as_is(self):
+        only = [("#ff0000", np.ones((4, 4), bool))]
+        self.assertIs(_tuck_fills_under_ink(only, reach=4, speck_area=10), only)
+
+    def test_no_seam_between_fill_and_ink_end_to_end(self):
+        """Every opaque pixel of the keylined art is covered by some layer."""
         outcome = vectorize_bytes(
             png_bytes(keylined_art()),
             preset_name="logo",
             overrides={"background": "never", "engine": "potrace"},
         )
-        fills = re.findall(r'<path[^>]*?fill="(#[0-9a-fA-F]{6})"[^>]*?>', outcome.svg)
-        stroked = re.findall(r'<path[^>]*?stroke="(#[0-9a-fA-F]{6})"[^>]*?>', outcome.svg)
-        self.assertTrue(stroked, "no underlay was emitted")
-        self.assertEqual(fills[0], stroked[0], f"underlay is not first: {fills[:3]}")
-        self.assertEqual(fills[-1], stroked[0], "line work is not painted last")
+        self.assertNotIn("stroke=", outcome.svg, "the old stroked underlay is back")
+        fills = re.findall(r'<path[^>]*?fill="(#[0-9a-fA-F]{6})"', outcome.svg)
+        luma = [0.299 * int(f[1:3], 16) + 0.587 * int(f[3:5], 16) + 0.114 * int(f[5:7], 16) for f in fills]
+        self.assertEqual(luma[-1], min(luma), "line work is not painted last")
+
+
+class TestUnblendLineEdges(unittest.TestCase):
+    """Anti-aliased stroke edges go to the fill they were blended from.
+
+    A pixel half way between a pale fill and the ink averages out to a mid
+    colour, and plain nearest-colour quantization hands it to whichever *third*
+    palette entry happens to sit there - a blue notch eaten out of the corner
+    of a pale-blue pole, a purple hairline along a pale-blue stroke.
+    """
+
+    PALETTE = np.array([[39, 39, 39], [208, 229, 230], [77, 145, 194]], np.uint8)
+
+    def image(self):
+        """Pale | ink | pale, with the pale-to-ink edge column quantized blue."""
+        rgba = np.zeros((10, 12, 4), np.uint8)
+        rgba[..., 3] = 255
+        rgba[..., :3] = self.PALETTE[1]
+        rgba[:, 5:7, :3] = self.PALETTE[0]
+        original = rgba[..., :3].copy()
+        mix = (0.6 * self.PALETTE[1] + 0.4 * self.PALETTE[0]).astype(np.uint8)
+        original[:, 4] = mix
+        rgba[:, 4, :3] = self.PALETTE[2]  # what nearest-colour made of the blend
+        rgba[0, 11, :3] = self.PALETTE[2]  # blue really is in this artwork
+        return rgba, original
+
+    def test_a_blend_goes_back_to_the_fill_it_came_from(self):
+        rgba, original = self.image()
+        out, changed = _unblend_line_edges(rgba, self.PALETTE, original, reach=2)
+        self.assertEqual(changed, 10)
+        self.assertTrue((out[:, 4, :3] == self.PALETTE[1]).all())
+
+    def test_a_real_region_of_the_third_colour_is_left_alone(self):
+        rgba, original = self.image()
+        rgba[:, 0:3, :3] = self.PALETTE[2]
+        original[:, 0:3] = self.PALETTE[2]
+        out, _ = _unblend_line_edges(rgba, self.PALETTE, original, reach=2)
+        self.assertTrue((out[:, 0:3, :3] == self.PALETTE[2]).all())
+
+    def test_the_ink_is_never_moved(self):
+        rgba, original = self.image()
+        out, _ = _unblend_line_edges(rgba, self.PALETTE, original, reach=2)
+        self.assertTrue((out[:, 5:7, :3] == self.PALETTE[0]).all())
+
+    def test_the_ink_never_grows(self):
+        """Even a mostly-ink blend stays a fill: stroke weight is not ours to set."""
+        rgba, original = self.image()
+        original[:, 4] = (0.2 * self.PALETTE[1] + 0.8 * self.PALETTE[0]).astype(np.uint8)
+        out, _ = _unblend_line_edges(rgba, self.PALETTE, original, reach=2)
+        self.assertTrue((out[:, 4, :3] == self.PALETTE[1]).all())
 
 
 def small_pale_region(size: int = 1200) -> Image.Image:
