@@ -41,6 +41,7 @@ from errors import EngineError
 from logging_config import get_logger
 from presets import Preset, PotraceParams
 
+from . import centerline
 from .base import BaseVectorizer, EngineResult, registry
 
 log = get_logger(__name__)
@@ -98,6 +99,8 @@ class PotraceVectorizer(BaseVectorizer):
         layers = _tuck_fills_under_ink(
             layers, reach=params.ink_tuck, speck_area=params.speck_area
         )
+        layers, strokes = _centreline_strokes(layers, params)
+        layers = _underlap_later_layers(layers, params.fill_underlap)
 
         if not layers:
             raise EngineError(
@@ -148,6 +151,8 @@ class PotraceVectorizer(BaseVectorizer):
                     path_elements.append(f'<path fill="{hex_color}" d="{d}"/>')
                 if ds:
                     layer_meta.append({"color": hex_color, "subpaths": len(ds)})
+
+        path_elements.extend(strokes)
 
         if not path_elements:
             raise EngineError(
@@ -344,6 +349,74 @@ def _tuck_fills_under_ink(
         if int(grown.sum()) >= _MIN_LAYER_PIXELS:
             result.append((hex_color, grown))
     result.append((layers[-1][0], ink))
+    return result
+
+
+def _centreline_strokes(
+    layers: list[tuple[str, np.ndarray]], params: PotraceParams
+) -> tuple[list[tuple[str, np.ndarray]], list[str]]:
+    """Take the thin line work out of the ink layer and stroke its centreline.
+
+    Returns the layers with the ink reduced to its thick shapes, and the
+    stroke elements to paint on top of everything - see ``engines.centerline``
+    for why outline tracing cannot give thin strokes an even weight. The fills
+    were already tucked under the *full* ink mask, so they still run on
+    underneath the strokes.
+    """
+    if not params.centreline or len(layers) < 2:
+        return layers, []
+    hex_color, ink = layers[-1]
+    thick, thin = centerline.split_linework(ink, params.centreline_max_width)
+    strokes = centerline.trace_strokes(
+        thin,
+        anchor=thick,
+        smooth_sigma=params.centreline_smooth,
+        weight=params.stroke_weight,
+    )
+    if not strokes:
+        return layers, []
+    elements = [
+        f'<path fill="none" stroke="{hex_color}" stroke-width="{s.width:.2f}" '
+        f'stroke-linecap="round" stroke-linejoin="round" '
+        f'd="{centerline.stroke_to_path_d(s)}"/>'
+        for s in strokes
+    ]
+    rest = layers[:-1]
+    if int(thick.sum()) >= _MIN_LAYER_PIXELS:
+        rest = rest + [(hex_color, thick)]
+    return rest, elements
+
+
+def _underlap_later_layers(
+    layers: list[tuple[str, np.ndarray]], distance: float
+) -> list[tuple[str, np.ndarray]]:
+    """Run each fill a little way on underneath every layer painted after it.
+
+    Two fills that meet with no line work between them - a pale pole against
+    a blue panel - are traced on their own masks, and each curve fit can pull
+    back from the shared edge by up to a pixel. Where both pull back, nobody
+    paints the pixels between them and the background shows as a white
+    sliver. Growing the earlier layer under the later one fills that sliver
+    with the neighbouring colour instead, and moves no visible edge: the
+    later layer is painted on top of the overlap, so what shows is exactly
+    its own traced outline, as before.
+
+    Only fills grow, only into pixels a *later* layer owns, and never out past
+    the artwork into transparency. The first layer painted is the only one
+    nothing grows under, which is why paint order starts from the largest
+    (usually the canvas colour).
+    """
+    if distance <= 0 or len(layers) < 2:
+        return layers
+    radius = max(1, round(distance))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
+    result = list(layers)
+    later = np.zeros(layers[0][1].shape, dtype=bool)
+    for index in range(len(layers) - 2, -1, -1):
+        later |= layers[index + 1][1]
+        hex_color, mask = layers[index]
+        spread = cv2.dilate(mask.astype(np.uint8), kernel) > 0
+        result[index] = (hex_color, mask | (spread & later))
     return result
 
 

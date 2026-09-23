@@ -108,6 +108,25 @@ class PotraceParams:
     # Quantization strands a few pixels of the wrong colour at three-colour
     # junctions; turdsize would drop them and leave a hole instead.
     speck_area: int = 12
+    # Trace thin line work by its centre and emit it as SVG strokes of one
+    # width per connected network, instead of as filled outlines whose two
+    # edges are fitted independently (see ``engines.centerline``). Thin means
+    # narrower than ``centreline_max_width`` pixels (rescaled for
+    # supersampling); anything wider - lettering, solid bars, a dark backdrop
+    # - stays a filled shape.
+    # How far, in pixels, each fill runs on under the layers painted after it
+    # (see ``_underlap_later_layers``) so a seam between two fills with no
+    # line work between them can never show background. Rescaled for
+    # supersampling. Measured on the sticker artwork: unpainted pixels inside
+    # the artwork 49 -> 0 (and 128 -> 0 with the background kept), with no change
+    # in RMSE or file size. 0 disables it.
+    fill_underlap: float = 1.5
+    centreline: bool = True
+    centreline_max_width: float = 3.0
+    # Gaussian smoothing along the centreline, in pixels (rescaled).
+    centreline_smooth: float = 1.0
+    # Multiplier on the measured stroke width.
+    stroke_weight: float = 1.0
     # Cap on distinct colour layers traced. Each layer is one subprocess call,
     # so this bounds worst-case latency on artwork that reached this engine
     # unquantized. Presets that already quantize (flat_art, logo, ...) never
@@ -578,6 +597,9 @@ def scale_engine_params(
             turdsize=max(1, round(params.turdsize * factor * factor)),
             speck_area=round(params.speck_area * factor * factor),
             ink_tuck=params.ink_tuck * factor,
+            centreline_max_width=params.centreline_max_width * factor,
+            fill_underlap=params.fill_underlap * factor,
+            centreline_smooth=params.centreline_smooth * factor,
         )
 
     return replace(
@@ -667,6 +689,11 @@ _POTRACE_ENGINE_OVERRIDES = {
     "opttolerance": float,
     "ink_tuck": lambda v: float(min(16.0, max(0.0, float(v)))),
     "speck_area": lambda v: int(min(1000, max(0, int(v)))),
+    "fill_underlap": lambda v: float(min(8.0, max(0.0, float(v)))),
+    "centreline": bool,
+    "centreline_max_width": lambda v: float(min(20.0, max(1.0, float(v)))),
+    "centreline_smooth": lambda v: float(min(5.0, max(0.0, float(v)))),
+    "stroke_weight": lambda v: float(min(3.0, max(0.2, float(v)))),
 }
 
 # A client may force a different tracing backend onto an existing preset (used

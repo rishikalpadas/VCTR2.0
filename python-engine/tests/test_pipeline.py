@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
@@ -44,7 +45,11 @@ from svg_export import (  # noqa: E402
 )
 from svg_optimizer import validate_svg  # noqa: E402
 from vectorizer import vectorize_bytes  # noqa: E402
-from engines.potrace_engine import _tuck_fills_under_ink  # noqa: E402
+from engines import centerline  # noqa: E402
+from engines.potrace_engine import (  # noqa: E402
+    _tuck_fills_under_ink,
+    _underlap_later_layers,
+)
 
 SAMPLES = Path(__file__).resolve().parents[2] / "samples"
 
@@ -756,11 +761,15 @@ class TestLinework(unittest.TestCase):
         wins. With the ink painted first, every fill bulged into it by however
         much its own curve fit happened to differ - the stroke reads thinner in
         some places, and the fill that ate it shows as colour inside the stroke.
+
+        Centreline tracing is off here: with it on, this art's line work is all
+        strokes painted after every layer, and there is no filled ink layer to
+        order (see TestCentreline).
         """
         outcome = vectorize_bytes(
             png_bytes(keylined_art()),
             preset_name="logo",
-            overrides={"background": "never", "engine": "potrace"},
+            overrides={"background": "never", "engine": "potrace", "centreline": False},
         )
         order = [layer["color"] for layer in outcome.meta["engine_meta"]["layers"]]
         luma = lambda h: (  # noqa: E731
@@ -930,10 +939,152 @@ class TestInkTuck(unittest.TestCase):
             preset_name="logo",
             overrides={"background": "never", "engine": "potrace"},
         )
-        self.assertNotIn("stroke=", outcome.svg, "the old stroked underlay is back")
-        fills = re.findall(r'<path[^>]*?fill="(#[0-9a-fA-F]{6})"', outcome.svg)
-        luma = [0.299 * int(f[1:3], 16) + 0.587 * int(f[3:5], 16) + 0.114 * int(f[5:7], 16) for f in fills]
+        stroked_fills = re.findall(r'<path[^>]*?fill="#[0-9a-fA-F]{6}"[^>]*?stroke=', outcome.svg)
+        self.assertEqual(stroked_fills, [], "the old stroked underlay is back")
+        # The ink is painted last, whether as filled shapes or as strokes.
+        paint = [
+            stroke if stroke.startswith("#") else fill
+            for fill, stroke in re.findall(
+                r'<path(?=[^>]*?fill="([^"]*)")(?:(?=[^>]*?stroke="([^"]*)"))?', outcome.svg
+            )
+        ]
+        luma = [0.299 * int(f[1:3], 16) + 0.587 * int(f[3:5], 16) + 0.114 * int(f[5:7], 16) for f in paint]
         self.assertEqual(luma[-1], min(luma), "line work is not painted last")
+
+
+class TestFillUnderlap(unittest.TestCase):
+    """A seam between two fills with no line between them never shows background.
+
+    Each fill is traced on its own mask, and both curve fits can pull back from
+    the shared edge - the white sliver down the side of a pale pole against a
+    blue panel. The earlier layer runs on under the later one, so the sliver
+    is painted with the neighbouring colour and no visible edge moves.
+    """
+
+    @staticmethod
+    def pair():
+        blue = np.zeros((20, 40), bool)
+        pale = np.zeros((20, 40), bool)
+        blue[:, :20] = True
+        pale[:, 20:] = True
+        ink = np.zeros((20, 40), bool)
+        return [("#4d91c2", blue), ("#d0e5e6", pale), ("#272727", ink)]
+
+    def test_earlier_fill_runs_under_the_later_one(self):
+        out = _underlap_later_layers(self.pair(), 2)
+        self.assertTrue(out[0][1][:, 20:22].all(), "no underlap into the later fill")
+        self.assertFalse(out[0][1][:, 23:].any(), "underlap went too far")
+
+    def test_the_later_fill_is_unchanged(self):
+        """What shows at the seam is still the later layer's own outline."""
+        layers = self.pair()
+        out = _underlap_later_layers(layers, 2)
+        np.testing.assert_array_equal(out[1][1], layers[1][1])
+        np.testing.assert_array_equal(out[2][1], layers[2][1])
+
+    def test_never_grows_into_transparency(self):
+        layers = self.pair()
+        layers[1][1][:, 30:] = False  # right of column 30 is transparent
+        out = _underlap_later_layers(layers, 20)
+        self.assertFalse(out[0][1][:, 30:].any())
+
+    def test_can_be_switched_off(self):
+        layers = self.pair()
+        self.assertIs(_underlap_later_layers(layers, 0), layers)
+
+
+class TestCentreline(unittest.TestCase):
+    """Thin line work is stroked along its centre at one width.
+
+    Outline tracing fits a stroke's two edges independently, and at tracing
+    resolution a stroke is only two or three pixels wide - so each edge's
+    half-pixel fitting error swings the width by a fifth, differently along
+    every stroke. That is the "thinner here, bolder there" line work.
+    """
+
+    @staticmethod
+    def canvas(h: int = 60, w: int = 120) -> np.ndarray:
+        return np.zeros((h, w), bool)
+
+    def test_a_straight_line_becomes_one_stroke_at_its_width(self):
+        ink = self.canvas()
+        ink[29:32, 10:110] = True  # 3px wide
+        strokes = centerline.trace_strokes(ink, smooth_sigma=1.0)
+        self.assertEqual(len(strokes), 1)
+        self.assertAlmostEqual(strokes[0].width, 3.0, delta=0.5)
+        xs = strokes[0].points[:, 0]
+        self.assertLess(xs.min(), 13)
+        self.assertGreater(xs.max(), 107)
+
+    def test_one_width_for_a_whole_network(self):
+        """Uneven raster weight along a stroke comes back even."""
+        ink = self.canvas()
+        ink[28:32, 10:60] = True   # 4px
+        ink[29:31, 60:110] = True  # 2px, same network
+        strokes = centerline.trace_strokes(ink, smooth_sigma=1.0)
+        self.assertEqual(len({round(st.width, 3) for st in strokes}), 1)
+
+    def test_short_spurs_are_dropped(self):
+        """A stub off a junction is the nub, not artwork."""
+        ink = self.canvas()
+        ink[29:32, 10:110] = True
+        ink[25:29, 60:63] = True  # 4px stub on a 3px line
+        strokes = centerline.trace_strokes(ink, smooth_sigma=1.0)
+        for st in strokes:
+            self.assertGreater(st.points[:, 1].min(), 26, "the stub was traced")
+
+    def test_real_branches_survive(self):
+        ink = self.canvas()
+        ink[29:32, 10:110] = True
+        ink[5:29, 60:63] = True  # a real 24px branch
+        strokes = centerline.trace_strokes(ink, smooth_sigma=1.0)
+        self.assertLess(min(st.points[:, 1].min() for st in strokes), 10)
+
+    def test_a_ring_is_one_closed_stroke(self):
+        ink = np.zeros((80, 80), np.uint8)
+        cv2.circle(ink, (40, 40), 25, 1, 3)
+        strokes = centerline.trace_strokes(ink.astype(bool), smooth_sigma=1.0)
+        self.assertTrue(any(st.closed for st in strokes))
+        self.assertTrue(centerline.stroke_to_path_d(max(strokes, key=lambda st: len(st.points))).endswith("Z"))
+
+    def test_thick_shapes_stay_filled(self):
+        ink = self.canvas()
+        ink[10:50, 10:50] = True    # a solid block
+        ink[29:32, 50:110] = True   # a stroke leaving it
+        thick, thin = centerline.split_linework(ink, max_width=6)
+        self.assertTrue(thick[20:40, 20:40].all())
+        self.assertTrue(thin[29:32, 60:100].all())
+        self.assertFalse(thin[20:40, 20:40].any())
+
+    def test_curves_never_overshoot_their_points(self):
+        """A rule simplified to uneven points must not loop past its ends."""
+        stroke = centerline.Stroke(
+            points=np.array([[0.0, 0.0], [2.0, 0.2], [700.0, 0.4], [702.0, 0.0]]),
+            closed=False,
+            width=2.0,
+        )
+        numbers = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", centerline.stroke_to_path_d(stroke, epsilon=0.01))]
+        xs = numbers[0::2]
+        self.assertGreaterEqual(min(xs), -1.0)
+        self.assertLessEqual(max(xs), 703.0)
+
+    def test_end_to_end_line_work_is_stroked(self):
+        outcome = vectorize_bytes(
+            png_bytes(keylined_art()),
+            preset_name="logo",
+            overrides={"background": "never", "engine": "potrace"},
+        )
+        widths = set(re.findall(r'stroke-width="([\d.]+)"', outcome.svg))
+        self.assertTrue(widths, "no centreline strokes were emitted")
+        self.assertIn('fill="none"', outcome.svg)
+
+    def test_centreline_can_be_switched_off(self):
+        outcome = vectorize_bytes(
+            png_bytes(keylined_art()),
+            preset_name="logo",
+            overrides={"background": "never", "engine": "potrace", "centreline": False},
+        )
+        self.assertNotIn("stroke-width", outcome.svg)
 
 
 class TestUnblendLineEdges(unittest.TestCase):
