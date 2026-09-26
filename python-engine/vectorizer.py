@@ -25,7 +25,14 @@ from errors import EngineError, VectorizationError
 from image_io import load_image
 from logging_config import get_logger
 from preprocessing import preprocess
-from presets import AUTO_PRESET_NAME, apply_overrides, get_preset, scale_engine_params
+from presets import (
+    AUTO_PRESET_NAME,
+    POTRACE_LIGHT_SMOOTH,
+    POTRACE_LIGHT_SMOOTH_MAX_GROWTH,
+    apply_overrides,
+    get_preset,
+    scale_engine_params,
+)
 from svg_optimizer import finalize_svg
 
 log = get_logger(__name__)
@@ -82,44 +89,45 @@ def vectorize_bytes(
             "pipeline planned for V2."
         )
 
-    # 4. Preprocess ---------------------------------------------------------
-    prepared = preprocess(
-        rgba, preset.preprocess, analysis, source_format=info["format"]
-    )
-    warnings.extend(prepared.warnings)
-
-    # Supersampling changes the pixel scale the engine works in, so its
-    # pixel-denominated thresholds have to move with it. Done here rather than
-    # inside the engine so engines stay unaware of preprocessing.
-    if prepared.supersample > 1.0:
-        preset = replace(
+    # 4-6. Preprocess, vectorize, clean up -----------------------------------
+    smoothing_report = None
+    user_set_smoothing = bool(overrides) and "boundary_smooth_sigma" in overrides
+    if (
+        preset.engine == "potrace"
+        and preset.preprocess.quantize_colors is not None
+        and not user_set_smoothing
+        and preset.preprocess.boundary_smooth_sigma > POTRACE_LIGHT_SMOOTH
+    ):
+        light = replace(
             preset,
-            engine_params=scale_engine_params(
-                preset.engine_params, prepared.supersample
-            ),
+            preprocess=replace(preset.preprocess, boundary_smooth_sigma=POTRACE_LIGHT_SMOOTH),
         )
-
-    # 5. Vectorize ----------------------------------------------------------
-    try:
-        engine = registry.get(preset.engine)
-    except KeyError as exc:
-        raise EngineError(
-            "The configured vectorization engine is not available.",
-            detail=str(exc),
-        ) from exc
-
-    engine_result = engine.vectorize(prepared.image, preset)
-
-    # 6. Cleanup + validate -------------------------------------------------
-    optimized = finalize_svg(
-        engine_result.svg,
-        processed_width=prepared.processed_width,
-        processed_height=prepared.processed_height,
-        original_width=info["original_width"],
-        original_height=info["original_height"],
-        params=preset.optimize,
-        palette=prepared.palette,
-    )
+        # Light smoothing keeps corners and thin details crisp, but on a noisy
+        # source it leaves the noise on every edge and Potrace traces it - an
+        # outlined script came back with a sawtooth edge at 3.6x the path data
+        # of the standard trace. So trace both and keep the light one only
+        # when it costs little extra path data: on clean edges there is
+        # nothing extra for it to trace (the WEAKNESS sticker: 0.99x).
+        standard_sigma = preset.preprocess.boundary_smooth_sigma
+        light_run = _trace(rgba, light, analysis, info)
+        standard_run = _trace(rgba, preset, analysis, info)
+        light_bytes = light_run[2].bytes_after
+        standard_bytes = standard_run[2].bytes_after
+        use_light = light_bytes <= standard_bytes * POTRACE_LIGHT_SMOOTH_MAX_GROWTH
+        if use_light:
+            preset, (prepared, engine_result, optimized) = light, light_run
+        else:
+            prepared, engine_result, optimized = standard_run
+        smoothing_report = {
+            "chosen_sigma": preset.preprocess.boundary_smooth_sigma,
+            "light_sigma": POTRACE_LIGHT_SMOOTH,
+            "standard_sigma": standard_sigma,
+            "light_svg_bytes": light_bytes,
+            "standard_svg_bytes": standard_bytes,
+        }
+    else:
+        prepared, engine_result, optimized = _trace(rgba, preset, analysis, info)
+    warnings.extend(prepared.warnings)
     warnings.extend(optimized.warnings)
 
     if optimized.path_count > 12_000:
@@ -160,6 +168,8 @@ def vectorize_bytes(
         "engine_meta": engine_result.meta,
         "warnings": warnings,
     }
+    if smoothing_report is not None:
+        meta["smoothing"] = smoothing_report
 
     log.info(
         "Done in %.0f ms: preset=%s paths=%d size=%.1f KB",
@@ -169,6 +179,45 @@ def vectorize_bytes(
         optimized.bytes_after / 1024,
     )
     return VectorizeOutcome(svg=optimized.svg, meta=meta)
+
+
+def _trace(rgba, preset, analysis, info):
+    """Preprocess, vectorize and finalize with one preset."""
+    prepared = preprocess(
+        rgba, preset.preprocess, analysis, source_format=info["format"]
+    )
+
+    # Supersampling changes the pixel scale the engine works in, so its
+    # pixel-denominated thresholds have to move with it. Done here rather than
+    # inside the engine so engines stay unaware of preprocessing.
+    if prepared.supersample > 1.0:
+        preset = replace(
+            preset,
+            engine_params=scale_engine_params(
+                preset.engine_params, prepared.supersample
+            ),
+        )
+
+    try:
+        engine = registry.get(preset.engine)
+    except KeyError as exc:
+        raise EngineError(
+            "The configured vectorization engine is not available.",
+            detail=str(exc),
+        ) from exc
+
+    engine_result = engine.vectorize(prepared.image, preset)
+
+    optimized = finalize_svg(
+        engine_result.svg,
+        processed_width=prepared.processed_width,
+        processed_height=prepared.processed_height,
+        original_width=info["original_width"],
+        original_height=info["original_height"],
+        params=preset.optimize,
+        palette=prepared.palette,
+    )
+    return prepared, engine_result, optimized
 
 
 def describe_engines() -> list[dict]:

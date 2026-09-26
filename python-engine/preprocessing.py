@@ -19,7 +19,7 @@ Rationale for the order:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import cv2
 import numpy as np
@@ -85,6 +85,7 @@ def preprocess(
         else (None, None)
     )
 
+    params = _skip_lossy_downscale(params, original_width, original_height)
     working, base_scale = _resize(rgba, params, steps)
     working = _clamp_border(working)
 
@@ -209,6 +210,30 @@ def _resize(
     resized = cv2.resize(rgba, new_size, interpolation=interpolation)
     steps.append(f"resize({width}x{height}->{new_size[0]}x{new_size[1]})")
     return resized, scale
+
+
+def _skip_lossy_downscale(
+    params: PreprocessParams, width: int, height: int
+) -> PreprocessParams:
+    """Work at source resolution when supersampling would exceed it anyway.
+
+    A 1600px source under max_dimension=1100 and supersample=2 was averaged
+    down to 1100px and then interpolated back up to 2200px: traced at more
+    pixels than the source has, from a copy that had already thrown a third
+    of them away. That bottleneck is what rounds letter corners and wobbles
+    thin keylines. Keeping the source and supersampling it by the remaining
+    factor reaches the same traced size with nothing discarded; the
+    output-pixel settings then scale by that smaller factor, so they stay
+    the same size in source pixels.
+    """
+    longest = max(width, height)
+    ceiling = min(params.max_dimension, settings.absolute_max_dimension)
+    if params.supersample <= 1.0 or longest <= ceiling:
+        return params
+    target = min(ceiling * params.supersample, settings.absolute_max_dimension)
+    if longest >= target:
+        return params
+    return replace(params, max_dimension=longest, supersample=target / longest)
 
 
 def _supersample(

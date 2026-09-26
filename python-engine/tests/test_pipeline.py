@@ -47,6 +47,7 @@ from svg_optimizer import validate_svg  # noqa: E402
 from vectorizer import vectorize_bytes  # noqa: E402
 from engines import centerline  # noqa: E402
 from engines.potrace_engine import (  # noqa: E402
+    _sharpen_corners,
     _tuck_fills_under_ink,
     _underlap_later_layers,
 )
@@ -322,6 +323,19 @@ class TestSupersampling(unittest.TestCase):
             overrides={"supersample": 1.0},
         )
         self.assertEqual(outcome.meta["supersample"], 1.0)
+
+    def test_no_downscale_that_supersampling_would_undo(self):
+        """1600px under max 1100 x2 traces at 2200 straight from the source."""
+        outcome = vectorize_bytes(png_bytes(donut(1600)), preset_name="logo")
+        self.assertFalse(any(s.startswith("resize") for s in outcome.meta["preprocess_steps"]))
+        self.assertEqual(outcome.meta["processed_width"], 2200)
+        self.assertAlmostEqual(outcome.meta["supersample"], 2200 / 1600, places=3)
+
+    def test_sources_past_the_traced_size_are_still_reduced(self):
+        outcome = vectorize_bytes(
+            png_bytes(donut(1600)), preset_name="logo", overrides={"supersample": 1.0}
+        )
+        self.assertIn("resize(1600x1600->1100x1100)", outcome.meta["preprocess_steps"])
 
 
 class TestCurveQuality(unittest.TestCase):
@@ -601,7 +615,84 @@ class TestSmoothingIsNotGated(unittest.TestCase):
         self.assertEqual(self.applied_sigma(outcome), 0.0)
 
 
+class TestLockedOutput(unittest.TestCase):
+    """Approved outputs that must not change, byte for byte.
+
+    The WEAKNESS sticker was tuned by eye in CorelDRAW until its lines, circle
+    and letter corners were right, and these files are the approved result of
+    the engine lab's auto preset with the background kept. Any change that
+    alters them - however it scores elsewhere - has to be re-approved and the
+    fixture regenerated deliberately, never updated to make the test pass.
+    """
+
+    FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+    def check(self, engine: str):
+        source = (self.FIXTURES / "weakness.jpeg").read_bytes()
+        outcome = vectorize_bytes(
+            source, preset_name="auto", overrides={"background": "never", "engine": engine}
+        )
+        expected = (self.FIXTURES / f"weakness-{engine}.svg").read_text(encoding="utf-8")
+        self.assertEqual(outcome.svg, expected, f"the approved {engine} output changed")
+
+    def test_weakness_potrace_output_is_unchanged(self):
+        self.check("potrace")
+
+    def test_weakness_vtracer_output_is_unchanged(self):
+        self.check("vtracer")
+
+
 class TestOverrides(unittest.TestCase):
+    @staticmethod
+    def blocks() -> bytes:
+        img = np.full((500, 700, 3), (200, 200, 250), np.uint8)
+        for i in range(5):
+            cv2.rectangle(img, (40 + 130 * i, 80), (140 + 130 * i, 400), (30, 30, 30), -1)
+            cv2.rectangle(img, (65 + 130 * i, 120), (115 + 130 * i, 360), (250, 250, 250), -1)
+        return png_bytes(Image.fromarray(img))
+
+    @staticmethod
+    def noisy_rings() -> bytes:
+        img = np.full((500, 700, 3), (200, 200, 250), np.uint8)
+        for i, cx in enumerate((170, 350, 530)):
+            cv2.ellipse(img, (cx, 250), (70, 150), 10 * i, 0, 360, (30, 30, 30), 14, cv2.LINE_AA)
+            cv2.ellipse(img, (cx, 250), (50, 125), 10 * i, 0, 360, (250, 250, 250), -1, cv2.LINE_AA)
+        noise = np.random.default_rng(0).normal(0, 10, img.shape)
+        img = np.clip(img + noise, 0, 255).astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(img).save(buf, "JPEG", quality=60)
+        return buf.getvalue()
+
+    def potrace_smoothing(self, data: bytes, **extra) -> dict | None:
+        overrides = {"engine": "potrace", "background": "never", **extra}
+        return vectorize_bytes(data, preset_name="logo", overrides=overrides).meta.get("smoothing")
+
+    def test_potrace_keeps_light_smoothing_on_clean_edges(self):
+        chosen = self.potrace_smoothing(self.blocks())
+        self.assertEqual(chosen["chosen_sigma"], chosen["light_sigma"])
+
+    def test_potrace_falls_back_to_standard_smoothing_on_noisy_edges(self):
+        """Light smoothing on a noisy source traces the noise as a sawtooth."""
+        chosen = self.potrace_smoothing(self.noisy_rings())
+        self.assertEqual(chosen["chosen_sigma"], chosen["standard_sigma"])
+        self.assertGreater(chosen["light_svg_bytes"], chosen["standard_svg_bytes"] * 1.1)
+
+    def test_an_explicit_smoothing_value_still_wins_on_potrace(self):
+        outcome = vectorize_bytes(
+            self.blocks(),
+            preset_name="logo",
+            overrides={"engine": "potrace", "background": "never", "boundary_smooth_sigma": 1.4},
+        )
+        self.assertNotIn("smoothing", outcome.meta)
+        applied = 1.4 * outcome.meta["supersample"]
+        self.assertIn(f"boundary_smooth(sigma={applied:.2g})", outcome.meta["preprocess_steps"])
+
+    def test_vtracer_smoothing_is_untouched(self):
+        outcome = vectorize_bytes(
+            self.blocks(), preset_name="logo", overrides={"engine": "vtracer", "background": "never"}
+        )
+        self.assertNotIn("smoothing", outcome.meta)
+
     def test_quantization_can_actually_be_turned_off(self):
         """Regression: `None` was treated as "not supplied", so passing it did
         nothing and quantization ran anyway."""
@@ -1063,10 +1154,79 @@ class TestCentreline(unittest.TestCase):
             closed=False,
             width=2.0,
         )
-        numbers = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", centerline.stroke_to_path_d(stroke, epsilon=0.01))]
+        numbers = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", centerline.stroke_to_path_d(stroke, tolerance=0.01))]
         xs = numbers[0::2]
         self.assertGreaterEqual(min(xs), -1.0)
         self.assertLessEqual(max(xs), 703.0)
+
+    @staticmethod
+    def path_points(d: str) -> np.ndarray:
+        nums = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", d)]
+        return np.array(nums).reshape(-1, 2)
+
+    def test_a_wobbly_rule_comes_back_as_one_straight_line(self):
+        """Skeleton wobble must not survive as a wavy rule."""
+        xs = np.arange(0, 400, 1.0)
+        ys = 50 + 0.6 * np.sin(xs / 7.0)
+        stroke = centerline.Stroke(points=np.column_stack([xs, ys]), closed=False, width=3.0)
+        d = centerline.stroke_to_path_d(stroke)
+        self.assertNotIn("C", d)
+        self.assertEqual(d.count("L"), 1)
+        pts = self.path_points(d)
+        self.assertLess(np.abs(pts[:, 1] - 50).max(), 0.3)
+
+    def test_a_hooked_end_does_not_tilt_the_rule(self):
+        """The line is fitted to every point, not drawn between the ends."""
+        xs = np.arange(0, 300, 1.0)
+        ys = np.full_like(xs, 20.0)
+        ys[:2] = 19.0  # the skeleton bends in its last pixel
+        stroke = centerline.Stroke(points=np.column_stack([xs, ys]), closed=False, width=3.0)
+        pts = self.path_points(centerline.stroke_to_path_d(stroke))
+        self.assertLess(np.abs(pts[:, 1] - 20).max(), 0.1)
+
+    def test_a_ring_comes_back_as_an_exact_circle(self):
+        ink = np.zeros((120, 120), np.uint8)
+        cv2.circle(ink, (60, 60), 40, 1, 3)
+        strokes = centerline.trace_strokes(ink.astype(bool), smooth_sigma=1.0)
+        ring = max(strokes, key=lambda st: len(st.points))
+        d = centerline.stroke_to_path_d(ring)
+        self.assertEqual(d.count("C"), 4)
+        # cv2 draws the ring centred on pixel (60, 60), which spans 60..61.
+        on_curve = self.path_points(d)[[0, 3, 6, 9]]
+        radii = np.hypot(on_curve[:, 0] - 60.5, on_curve[:, 1] - 60.5)
+        self.assertLess(np.abs(radii - 40).max(), 0.6)
+
+    def test_corners_stay_sharp(self):
+        """A chevron is two straight runs meeting at a point, not an arc."""
+        left = np.column_stack([np.arange(0, 100.0), np.arange(0, 100.0)])
+        right = np.column_stack([np.arange(100, 200.0), np.arange(100, 0, -1.0)])
+        stroke = centerline.Stroke(points=np.vstack([left, right]), closed=False, width=3.0)
+        d = centerline.stroke_to_path_d(stroke)
+        self.assertNotIn("C", d)
+        apex = self.path_points(d)[1]
+        self.assertLess(np.hypot(apex[0] - 100, apex[1] - 100), 1.5)
+
+    def test_strokes_sit_on_the_pixel_centre(self):
+        """Pixel row y spans y..y+1 in SVG units, so its centre is y + 0.5."""
+        ink = self.canvas()
+        ink[29:32, 10:110] = True  # rows 29-31: spans 29..32, centre 30.5
+        stroke = centerline.trace_strokes(ink, smooth_sigma=1.0)[0]
+        self.assertAlmostEqual(float(np.median(stroke.points[:, 1])), 30.5, delta=0.05)
+
+    def test_merged_strokes_are_not_a_thick_shape(self):
+        """Two strokes running together are line work, not a filled blob."""
+        ink = self.canvas(80, 120)
+        ink[10:70, 50:54] = True
+        ink[10:70, 58:62] = True
+        ink[40:48, 50:62] = True  # a short 12x8 merge
+        thick, _ = centerline.split_linework(ink, max_width=6)
+        self.assertFalse(thick.any())
+
+    def test_thick_shapes_keep_their_corners(self):
+        ink = self.canvas()
+        ink[10:50, 10:50] = True
+        thick, _ = centerline.split_linework(ink, max_width=6)
+        self.assertTrue(thick[10, 10] and thick[10, 49] and thick[49, 10] and thick[49, 49])
 
     def test_end_to_end_line_work_is_stroked(self):
         outcome = vectorize_bytes(
@@ -1085,6 +1245,76 @@ class TestCentreline(unittest.TestCase):
             overrides={"background": "never", "engine": "potrace", "centreline": False},
         )
         self.assertNotIn("stroke-width", outcome.svg)
+
+
+class TestCornerRestoration(unittest.TestCase):
+    """Corners Potrace pillows come back sharp; arcs are left alone."""
+
+    # Potrace's own trace of a 27x30 px full stop at alphamax 1.0: four bowed
+    # curves, each spanning a side and half of both corners.
+    PILLOWED_SQUARE = (
+        "M 1732.100,1131.800 C 1730.400,1132.300 1729.300,1133.700 1728.700,1136.000 "
+        "C 1727.500,1140.700 1728.400,1158.800 1729.900,1160.300 "
+        "C 1731.600,1162.000 1752.500,1161.900 1754.200,1160.200 "
+        "C 1755.900,1158.500 1756.000,1134.600 1754.300,1132.900 "
+        "C 1752.900,1131.500 1735.700,1130.700 1732.100,1131.800 Z"
+    )
+
+    @staticmethod
+    def points(d: str) -> np.ndarray:
+        return np.array([float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", d)]).reshape(-1, 2)
+
+    def test_a_pillowed_square_gets_its_corners_back(self):
+        d = _sharpen_corners(self.PILLOWED_SQUARE, reach=4.1)
+        self.assertNotIn("C", d)
+        self.assertEqual(d.count("L"), 4)
+        corners = self.points(d)[:4]
+        # Each restored corner lies outside the pillowed outline's rounding,
+        # at the square's true corner.
+        for target in ([1728.3, 1131.2], [1728.9, 1161.3], [1755.2, 1161.2], [1755.3, 1132.0]):
+            self.assertLess(np.linalg.norm(corners - target, axis=1).min(), 1.0)
+
+    def test_a_circle_is_left_as_traced(self):
+        k = 0.5523 * 20
+        circle = (
+            f"M 120.000,100.000 C 120.000,{100 + k:.3f} {100 + k:.3f},120.000 100.000,120.000 "
+            f"C {100 - k:.3f},120.000 80.000,{100 + k:.3f} 80.000,100.000 "
+            f"C 80.000,{100 - k:.3f} {100 - k:.3f},80.000 100.000,80.000 "
+            f"C {100 + k:.3f},80.000 120.000,{100 - k:.3f} 120.000,100.000 Z"
+        )
+        self.assertEqual(_sharpen_corners(circle, reach=4.1), circle)
+
+    def test_end_to_end_squares_stay_square_and_discs_stay_round(self):
+        img = np.full((300, 400, 3), 255, np.uint8)
+        cv2.rectangle(img, (60, 90), (140, 170), (30, 30, 30), -1, cv2.LINE_AA)
+        cv2.circle(img, (280, 130), 45, (30, 30, 30), -1, cv2.LINE_AA)
+        outcome = vectorize_bytes(
+            png_bytes(Image.fromarray(img)),
+            preset_name="logo",
+            # Unoptimized, so path data stays absolute M/L/C.
+            overrides={"background": "never", "engine": "potrace", "optimize": False},
+        )
+        subpaths = []
+        for el in re.findall(r"<path[^>]*>", outcome.svg):
+            if "stroke-width" in el:
+                continue
+            d = re.search(r' d="([^"]+)"', el).group(1)
+            subpaths += [s for s in re.split(r"(?=M)", d) if s.strip()]
+        scale = outcome.meta["processed_width"] / 400
+
+        def bbox(sub):
+            pts = self.points(sub)
+            return pts.min(axis=0) / scale, pts.max(axis=0) / scale
+
+        def around(sub, x0, y0, x1, y1):
+            lo, hi = bbox(sub)
+            return abs(lo[0] - x0) < 4 and abs(lo[1] - y0) < 4 and abs(hi[0] - x1) < 4 and abs(hi[1] - y1) < 4
+
+        square = [s for s in subpaths if around(s, 60, 90, 141, 171)]
+        disc = [s for s in subpaths if around(s, 235, 85, 326, 176)]
+        self.assertTrue(square and disc, "square or disc outline not found")
+        self.assertTrue(any("C" not in s for s in square), "the square came back with curved corners")
+        self.assertTrue(all("C" in s for s in disc), "the disc lost its curves")
 
 
 class TestUnblendLineEdges(unittest.TestCase):
