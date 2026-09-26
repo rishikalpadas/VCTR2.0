@@ -615,6 +615,33 @@ class TestSmoothingIsNotGated(unittest.TestCase):
         self.assertEqual(self.applied_sigma(outcome), 0.0)
 
 
+class TestLockedOutput(unittest.TestCase):
+    """Approved outputs that must not change, byte for byte.
+
+    The WEAKNESS sticker was tuned by eye in CorelDRAW until its lines, circle
+    and letter corners were right, and these files are the approved result of
+    the engine lab's auto preset with the background kept. Any change that
+    alters them - however it scores elsewhere - has to be re-approved and the
+    fixture regenerated deliberately, never updated to make the test pass.
+    """
+
+    FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+    def check(self, engine: str):
+        source = (self.FIXTURES / "weakness.jpeg").read_bytes()
+        outcome = vectorize_bytes(
+            source, preset_name="auto", overrides={"background": "never", "engine": engine}
+        )
+        expected = (self.FIXTURES / f"weakness-{engine}.svg").read_text(encoding="utf-8")
+        self.assertEqual(outcome.svg, expected, f"the approved {engine} output changed")
+
+    def test_weakness_potrace_output_is_unchanged(self):
+        self.check("potrace")
+
+    def test_weakness_vtracer_output_is_unchanged(self):
+        self.check("vtracer")
+
+
 class TestOverrides(unittest.TestCase):
     def test_potrace_gets_lighter_boundary_smoothing(self):
         """The presets' smoothing is tuned for VTracer; Potrace needs less."""
