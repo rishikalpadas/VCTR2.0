@@ -147,6 +147,8 @@ class PotraceVectorizer(BaseVectorizer):
                     continue  # nothing traced for this layer (e.g. fully filtered by turdsize)
 
                 ds = _extract_absolute_path_ds(svg_path.read_text(encoding="utf-8"))
+                if params.corner_snap > 0:
+                    ds = [_sharpen_corners(d, params.corner_snap) for d in ds]
                 for d in ds:
                     path_elements.append(f'<path fill="{hex_color}" d="{d}"/>')
                 if ds:
@@ -378,7 +380,7 @@ def _centreline_strokes(
     elements = [
         f'<path fill="none" stroke="{hex_color}" stroke-width="{s.width:.2f}" '
         f'stroke-linecap="round" stroke-linejoin="round" '
-        f'd="{centerline.stroke_to_path_d(s)}"/>'
+        f'd="{centerline.stroke_to_path_d(s, params.centreline_tolerance)}"/>'
         for s in strokes
     ]
     rest = layers[:-1]
@@ -536,6 +538,180 @@ def _transform_path_d(d: str, tx: float, ty: float, sx: float, sy: float) -> str
             cur = subpath_start
 
     return " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Corner restoration
+# ---------------------------------------------------------------------------
+
+_SEGMENT_RE = re.compile(r"([MLCZ])([^MLCZ]*)")
+# Two edges must turn by at least this much to meet at a corner; below it
+# the short piece between them is a gentle bend, not a rounded corner.
+_MIN_CORNER_TURN_DEG = 25.0
+
+
+def _sharpen_corners(d: str, reach: float) -> str:
+    """Put back the corners Potrace rounds between two straight edges.
+
+    Potrace picks corners by one threshold (alphamax), and no setting of it is
+    right for both halves of flat art. Low enough to keep the corners of an A
+    or a full stop, it also breaks every gentle arc into polygon facets - the
+    S comes back as an octagon. High enough for the arcs, it pillows every
+    corner whose raster tip lost a pixel to anti-aliasing. So trace for the
+    arcs and restore the corners here: wherever two straight edges are joined
+    by curves spanning less than ``reach`` pixels, replace those curves with
+    the point where the two edges meet. A real arc is never flanked by
+    straight edges, so it is left alone.
+    """
+    out = []
+    for sub in re.split(r"(?=M)", d.strip()):
+        if sub:
+            out.append(_sharpen_subpath(sub, reach))
+    return " ".join(out)
+
+
+def _sharpen_subpath(sub: str, reach: float) -> str:
+    """Re-fit one closed outline with its corners restored.
+
+    Potrace's own segments cannot be used for this: at alphamax 1.0 it draws
+    a small square as four bowed curves, each spanning a side and half of
+    both corners, so there is no straight edge beside the corner to snap to.
+    Instead the outline is sampled densely and treated as a point chain, the
+    same way ``engines.centerline`` fits strokes: split where it turns by
+    more than ``_CORNER_ANGLE_DEG`` within ``reach`` pixels, fit each side as
+    a line if it is straight within tolerance and a tight cubic otherwise,
+    and put each corner between two straight sides where those sides meet.
+    An outline with no corners - an O, a dot of paint - is returned as traced.
+    """
+    tokens = _SEGMENT_RE.findall(sub)
+    if not tokens or tokens[0][0] != "M" or tokens[-1][0] != "Z":
+        return sub
+    points = _sample_outline(tokens)
+    if points is None or len(points) < 12:
+        return sub
+    # Wide on purpose: Potrace spreads a pillowed corner over several pixels,
+    # and a window narrower than that sees only part of the turn - the top
+    # corners of an A measured 34 degrees at 6px against 53 at 12px. Arcs
+    # that also turn fast over this span are weeded out below.
+    window = max(2, round(3 * reach / _SAMPLE_STEP))
+    corners = centerline._corners(points, window, _CORNER_ANGLE_DEG, closed=True)
+    straight_tol = _STRAIGHT_PER_REACH * reach
+
+    def sides(cs):
+        ring = np.vstack([np.roll(points, -cs[0], axis=0), points[cs[0] : cs[0] + 1]])
+        bounds = [(c - cs[0]) % n for c in cs] + [n]
+        runs = [ring[a : b + 1] for a, b in zip(bounds, bounds[1:])]
+        # A side's ends lie on the rounded corners, off the side's own line,
+        # so they are left out of the straightness test.
+        flat = [
+            centerline._straight(run, straight_tol, True, True, trim=window // 2) is not None
+            for run in runs
+        ]
+        return runs, flat
+
+    # A tight arc turns as fast as a rounded corner; what tells them apart is
+    # that a corner sits between two straight sides. Candidates are judged
+    # once, against their own sides: re-judging after each removal would let
+    # one rough side merge into its neighbours and strip the whole outline.
+    n = len(points)
+    if len(corners) >= 2:
+        _, flat = sides(corners)
+        corners = [c for k, c in enumerate(corners) if flat[k - 1] and flat[k]]
+    if len(corners) < 2:
+        return sub
+    points = np.roll(points, -corners[0], axis=0)
+    corners = [(c - corners[0]) % n for c in corners]
+    runs, flat = sides(corners)
+    fitted = [_fit_line(run) if ok else None for run, ok in zip(runs, flat)]
+
+    # Corner positions: the meeting point of two straight sides, when it is
+    # close to where the traced corner was; otherwise the traced corner.
+    count = len(runs)
+    corner_pts = []
+    for k in range(count):
+        before, after = fitted[k - 1], fitted[k]
+        traced = runs[k][0]
+        point = traced
+        if before is not None and after is not None:
+            hit = _intersect(before[0], before[0] + before[1], after[0], after[0] + after[1])
+            turn = np.degrees(np.arccos(np.clip(abs(float(before[1] @ after[1])), -1, 1)))
+            if hit is not None and turn >= _MIN_CORNER_TURN_DEG and np.linalg.norm(hit - traced) <= reach:
+                point = hit
+        corner_pts.append(point)
+
+    parts = [f"M {corner_pts[0][0]:.3f},{corner_pts[0][1]:.3f}"]
+    for k, run in enumerate(runs):
+        end = corner_pts[(k + 1) % count]
+        if fitted[k] is not None:
+            parts.append(f"L {end[0]:.3f},{end[1]:.3f}")
+            continue
+        run = run.copy()
+        run[0], run[-1] = corner_pts[k], end
+        for cmd in centerline._fit_run(run, _CURVE_TOLERANCE):
+            parts.append(cmd[0] + " " + cmd[1:])
+    parts.append("Z")
+    return " ".join(parts)
+
+
+_SAMPLE_STEP = 0.5  # pixels between outline samples
+# Candidate corners only; each must also sit between two straight sides.
+_CORNER_ANGLE_DEG = 40.0
+# How far a side may bow and still be drawn straight, as a share of reach.
+# Potrace bows the sides of a small square by about a pixel when it rounds
+# its corners; a genuinely curved side bows by far more over that length.
+_STRAIGHT_PER_REACH = 0.3
+_CURVE_TOLERANCE = 0.3
+
+
+def _sample_outline(tokens) -> np.ndarray | None:
+    start = np.array([float(v) for v in _NUM_RE.findall(tokens[0][1])[:2]])
+    cur = start
+    out = [start]
+    for cmd, args in tokens[1:-1]:
+        nums = [float(v) for v in _NUM_RE.findall(args)]
+        if cmd == "L":
+            end = np.array(nums[:2])
+            steps = max(1, int(np.ceil(np.linalg.norm(end - cur) / _SAMPLE_STEP)))
+            t = np.linspace(0, 1, steps + 1)[1:, None]
+            out.extend(cur + (end - cur) * t)
+        elif cmd == "C":
+            c1, c2, end = np.array(nums[0:2]), np.array(nums[2:4]), np.array(nums[4:6])
+            approx = np.linalg.norm(c1 - cur) + np.linalg.norm(c2 - c1) + np.linalg.norm(end - c2)
+            steps = max(2, int(np.ceil(approx / _SAMPLE_STEP)))
+            out.extend(centerline._bezier((cur, c1, c2, end), np.linspace(0, 1, steps + 1)[1:]))
+        else:
+            return None
+        cur = end
+    points = centerline._dedupe(np.array(out))
+    if np.linalg.norm(points[-1] - points[0]) < 1e-6:
+        points = points[:-1]
+    return points
+
+
+def _fit_line(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(centre, unit direction) of the least-squares line through a side.
+
+    The side's two ends sit on the rounded corners, so they are left out.
+    """
+    trim = max(1, len(points) // 6)
+    core = points[trim:-trim] if len(points) > 2 * trim + 2 else points
+    centre = core.mean(axis=0)
+    _, _, vt = np.linalg.svd(core - centre, full_matrices=False)
+    return centre, vt[0]
+
+
+def _intersect(a0, a1, b0, b1):
+    da, db = a1 - a0, b1 - b0
+    den = da[0] * db[1] - da[1] * db[0]
+    if abs(den) < 1e-9:
+        return None
+    t = ((b0[0] - a0[0]) * db[1] - (b0[1] - a0[1]) * db[0]) / den
+    return a0 + da * t
+
+
+def _unit(v):
+    n = np.linalg.norm(v)
+    return v / n if n > 1e-12 else v
 
 
 registry.register(PotraceVectorizer())

@@ -82,16 +82,19 @@ class PotraceParams:
     # (which is 0-100 and higher = more curve-friendly) - do not port the
     # number across, tune it fresh.
     #
-    # Below potrace's own 1.0 default on purpose. Flat art is full of real
-    # corners - tent apexes, letter joins, the point where two colour bands
-    # meet - and at 1.0 potrace rounds them into arcs. Measured on the badge
-    # artwork: 1.0 -> 0.6 drops RMSE at the line work's corners 21.47 -> 20.96
-    # and, despite more raw segments, makes the *optimized* file smaller
-    # (103.6 -> 101.7 KB), because a corner costs a line where an arc costs a
-    # cubic. Going further (0.4) buys another 0.1 for 18% more segments.
-    alphamax: float = 0.6
+    # Potrace's own default. No single value suits flat art: low enough to
+    # keep letter and band corners (0.6 was used before), it also breaks every
+    # gentle arc into polygon facets - an S came back as an octagon. So trace
+    # for the arcs here and let ``corner_snap`` restore the corners.
+    alphamax: float = 1.0
     # Bezier curve-fitting tolerance.
     opttolerance: float = 0.2
+    # Where two straight traced edges are joined by curves spanning less than
+    # this many pixels (rescaled), replace the curves with the edges' meeting
+    # point - see ``potrace_engine._sharpen_corners``. This is what gives an
+    # A's counter, a full stop and the tips of a bar their sharp corners back.
+    # 0 disables it.
+    corner_snap: float = 3.0
     # How far, in pixels, each fill layer runs on underneath the line work
     # (see ``_tuck_fills_under_ink``). A fill that stops exactly at a stroke
     # gets its outline fitted on the stroke's edge, and its curve fit then
@@ -125,6 +128,13 @@ class PotraceParams:
     centreline_max_width: float = 3.0
     # Gaussian smoothing along the centreline, in pixels (rescaled).
     centreline_smooth: float = 1.0
+    # How far, in pixels (rescaled), a fitted centreline curve may stray from
+    # the skeleton. The skeleton of a raster stroke wobbles by about a pixel;
+    # a curve held tighter than that reproduces the wobble as a wavy rule and
+    # a lumpy circle, one held looser starts cutting real curvature.
+    # Measured on sticker artwork: 0.8 -> 0.4 dropped RMSE 9.42 -> 8.25 with
+    # rules still exact lines and the sun still an exact circle.
+    centreline_tolerance: float = 0.4
     # Multiplier on the measured stroke width.
     stroke_weight: float = 1.0
     # Cap on distinct colour layers traced. Each layer is one subprocess call,
@@ -600,6 +610,8 @@ def scale_engine_params(
             centreline_max_width=params.centreline_max_width * factor,
             fill_underlap=params.fill_underlap * factor,
             centreline_smooth=params.centreline_smooth * factor,
+            centreline_tolerance=params.centreline_tolerance * factor,
+            corner_snap=params.corner_snap * factor,
         )
 
     return replace(
@@ -693,6 +705,8 @@ _POTRACE_ENGINE_OVERRIDES = {
     "centreline": bool,
     "centreline_max_width": lambda v: float(min(20.0, max(1.0, float(v)))),
     "centreline_smooth": lambda v: float(min(5.0, max(0.0, float(v)))),
+    "centreline_tolerance": lambda v: float(min(4.0, max(0.1, float(v)))),
+    "corner_snap": lambda v: float(min(12.0, max(0.0, float(v)))),
     "stroke_weight": lambda v: float(min(3.0, max(0.2, float(v)))),
 }
 
@@ -701,6 +715,15 @@ _POTRACE_ENGINE_OVERRIDES = {
 # swapping only the tracer). Whitelisted for the same reason every other
 # override is: the browser must not reach a backend we have not thought about.
 _ALLOWED_ENGINES = {"vtracer", "potrace"}
+
+# Ceiling on the preset's boundary smoothing when Potrace traces, unless the
+# caller set a value. The presets' 1.0-1.1 is tuned for VTracer, which joins
+# every pixel wobble with a straight segment unless the raster is smoothed
+# first. Potrace fits its own least-squares curves and restores corners
+# itself (corner_snap), so the extra smoothing only rounds what it would have
+# kept sharp. Measured on sticker artwork: 1.1 -> 0.6 took RMSE 8.71 -> 7.93
+# with letter corners sharp again.
+_POTRACE_MAX_SMOOTH = 0.6
 
 _ENGINE_DEFAULT_PARAMS: dict[str, type] = {
     "vtracer": VTracerParams,
@@ -733,6 +756,16 @@ def apply_overrides(preset: Preset, overrides: dict | None) -> Preset:
             updated,
             engine=requested_engine,
             engine_params=_ENGINE_DEFAULT_PARAMS[requested_engine](),
+        )
+
+    if (
+        updated.engine == "potrace"
+        and "boundary_smooth_sigma" not in pre_changes
+        and updated.preprocess.boundary_smooth_sigma > _POTRACE_MAX_SMOOTH
+    ):
+        updated = replace(
+            updated,
+            preprocess=replace(updated.preprocess, boundary_smooth_sigma=_POTRACE_MAX_SMOOTH),
         )
 
     engine_override_map = (
