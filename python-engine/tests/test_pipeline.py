@@ -643,18 +643,55 @@ class TestLockedOutput(unittest.TestCase):
 
 
 class TestOverrides(unittest.TestCase):
-    def test_potrace_gets_lighter_boundary_smoothing(self):
-        """The presets' smoothing is tuned for VTracer; Potrace needs less."""
-        logo = get_preset("logo")
-        self.assertGreater(logo.preprocess.boundary_smooth_sigma, 0.6)
-        potrace = apply_overrides(logo, {"engine": "potrace"})
-        self.assertEqual(potrace.preprocess.boundary_smooth_sigma, 0.6)
-        vtracer = apply_overrides(logo, {"engine": "vtracer"})
-        self.assertEqual(vtracer.preprocess.boundary_smooth_sigma, logo.preprocess.boundary_smooth_sigma)
+    @staticmethod
+    def blocks() -> bytes:
+        img = np.full((500, 700, 3), (200, 200, 250), np.uint8)
+        for i in range(5):
+            cv2.rectangle(img, (40 + 130 * i, 80), (140 + 130 * i, 400), (30, 30, 30), -1)
+            cv2.rectangle(img, (65 + 130 * i, 120), (115 + 130 * i, 360), (250, 250, 250), -1)
+        return png_bytes(Image.fromarray(img))
+
+    @staticmethod
+    def noisy_rings() -> bytes:
+        img = np.full((500, 700, 3), (200, 200, 250), np.uint8)
+        for i, cx in enumerate((170, 350, 530)):
+            cv2.ellipse(img, (cx, 250), (70, 150), 10 * i, 0, 360, (30, 30, 30), 14, cv2.LINE_AA)
+            cv2.ellipse(img, (cx, 250), (50, 125), 10 * i, 0, 360, (250, 250, 250), -1, cv2.LINE_AA)
+        noise = np.random.default_rng(0).normal(0, 10, img.shape)
+        img = np.clip(img + noise, 0, 255).astype(np.uint8)
+        buf = io.BytesIO()
+        Image.fromarray(img).save(buf, "JPEG", quality=60)
+        return buf.getvalue()
+
+    def potrace_smoothing(self, data: bytes, **extra) -> dict | None:
+        overrides = {"engine": "potrace", "background": "never", **extra}
+        return vectorize_bytes(data, preset_name="logo", overrides=overrides).meta.get("smoothing")
+
+    def test_potrace_keeps_light_smoothing_on_clean_edges(self):
+        chosen = self.potrace_smoothing(self.blocks())
+        self.assertEqual(chosen["chosen_sigma"], chosen["light_sigma"])
+
+    def test_potrace_falls_back_to_standard_smoothing_on_noisy_edges(self):
+        """Light smoothing on a noisy source traces the noise as a sawtooth."""
+        chosen = self.potrace_smoothing(self.noisy_rings())
+        self.assertEqual(chosen["chosen_sigma"], chosen["standard_sigma"])
+        self.assertGreater(chosen["light_svg_bytes"], chosen["standard_svg_bytes"] * 1.1)
 
     def test_an_explicit_smoothing_value_still_wins_on_potrace(self):
-        preset = apply_overrides(get_preset("logo"), {"engine": "potrace", "boundary_smooth_sigma": 1.4})
-        self.assertEqual(preset.preprocess.boundary_smooth_sigma, 1.4)
+        outcome = vectorize_bytes(
+            self.blocks(),
+            preset_name="logo",
+            overrides={"engine": "potrace", "background": "never", "boundary_smooth_sigma": 1.4},
+        )
+        self.assertNotIn("smoothing", outcome.meta)
+        applied = 1.4 * outcome.meta["supersample"]
+        self.assertIn(f"boundary_smooth(sigma={applied:.2g})", outcome.meta["preprocess_steps"])
+
+    def test_vtracer_smoothing_is_untouched(self):
+        outcome = vectorize_bytes(
+            self.blocks(), preset_name="logo", overrides={"engine": "vtracer", "background": "never"}
+        )
+        self.assertNotIn("smoothing", outcome.meta)
 
     def test_quantization_can_actually_be_turned_off(self):
         """Regression: `None` was treated as "not supplied", so passing it did

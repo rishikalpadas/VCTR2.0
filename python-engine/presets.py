@@ -716,14 +716,15 @@ _POTRACE_ENGINE_OVERRIDES = {
 # override is: the browser must not reach a backend we have not thought about.
 _ALLOWED_ENGINES = {"vtracer", "potrace"}
 
-# Ceiling on the preset's boundary smoothing when Potrace traces, unless the
-# caller set a value. The presets' 1.0-1.1 is tuned for VTracer, which joins
-# every pixel wobble with a straight segment unless the raster is smoothed
-# first. Potrace fits its own least-squares curves and restores corners
-# itself (corner_snap), so the extra smoothing only rounds what it would have
-# kept sharp. Measured on sticker artwork: 1.1 -> 0.6 took RMSE 8.71 -> 7.93
-# with letter corners sharp again.
-_POTRACE_MAX_SMOOTH = 0.6
+# Per-image boundary smoothing for Potrace (see vectorizer.vectorize_bytes).
+# The presets' 1.0-1.1 is tuned for VTracer. On a clean source Potrace does
+# better with less - it fits its own curves and restores corners itself - but
+# on a noisy one, less smoothing leaves the noise on every edge and Potrace
+# traces it as a sawtooth. So both are traced and the light one is kept only
+# if its SVG is at most this much larger. Measured on 13 test images: clean
+# sources grew 0.99-1.08x, noisy ones 1.20-3.57x.
+POTRACE_LIGHT_SMOOTH = 0.6
+POTRACE_LIGHT_SMOOTH_MAX_GROWTH = 1.10
 
 _ENGINE_DEFAULT_PARAMS: dict[str, type] = {
     "vtracer": VTracerParams,
@@ -756,16 +757,6 @@ def apply_overrides(preset: Preset, overrides: dict | None) -> Preset:
             updated,
             engine=requested_engine,
             engine_params=_ENGINE_DEFAULT_PARAMS[requested_engine](),
-        )
-
-    if (
-        updated.engine == "potrace"
-        and "boundary_smooth_sigma" not in pre_changes
-        and updated.preprocess.boundary_smooth_sigma > _POTRACE_MAX_SMOOTH
-    ):
-        updated = replace(
-            updated,
-            preprocess=replace(updated.preprocess, boundary_smooth_sigma=_POTRACE_MAX_SMOOTH),
         )
 
     engine_override_map = (
