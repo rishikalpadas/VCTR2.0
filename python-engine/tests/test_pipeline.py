@@ -1474,6 +1474,39 @@ class TestAnalysis(unittest.TestCase):
         result = analyze(np.array(image))
         self.assertTrue(result.has_alpha)
 
+    @staticmethod
+    def fabric_photo() -> np.ndarray:
+        """A logo printed on cloth: few colours, but texture everywhere."""
+        h, w = 600, 800
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        light = 30 * np.sin(xx / 170) * np.cos(yy / 230)  # folds / lighting
+        weave = np.random.default_rng(1).normal(0, 4, (h, w))
+        base = np.stack([185 + light + weave, 160 + light + weave, 130 + light + weave], axis=2)
+        img = np.clip(base, 0, 255).astype(np.uint8)
+        cv2.putText(img, "USPA", (140, 360), cv2.FONT_HERSHEY_TRIPLEX, 6, (235, 232, 220), 18, cv2.LINE_AA)
+        return np.dstack([img, np.full((h, w), 255, np.uint8)])
+
+    def test_a_photo_with_few_colours_is_still_a_photo(self):
+        """Colour count alone missed every garment photo in the test set."""
+        result = analyze(self.fabric_photo())
+        self.assertEqual(result.kind, ImageKind.PRODUCT_PHOTO)
+        self.assertGreater(result.texture_share, 0.3)
+
+    def test_a_jpeg_of_flat_art_is_not_a_photo(self):
+        buf = io.BytesIO()
+        keylined_art().convert("RGB").save(buf, "JPEG", quality=85)
+        rgba, _ = load_image(buf.getvalue())
+        result = analyze(rgba)
+        self.assertNotEqual(result.kind, ImageKind.PRODUCT_PHOTO)
+        self.assertLess(result.texture_share, 0.3)
+
+    def test_photos_get_the_approximation_warning(self):
+        outcome = vectorize_bytes(
+            png_bytes(Image.fromarray(self.fabric_photo()[..., :3])), preset_name="auto"
+        )
+        self.assertEqual(outcome.meta["preset_used"], "detailed")
+        self.assertTrue(any("photograph" in w for w in outcome.meta["warnings"]))
+
 
 class TestGeneratedSamples(unittest.TestCase):
     """Runs only if tests/make_samples.py has been executed."""

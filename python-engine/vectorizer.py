@@ -83,10 +83,11 @@ def vectorize_bytes(
 
     if analysis.kind in _APPROXIMATION_KINDS:
         warnings.append(
-            "This looks like a photograph rather than clean digital artwork. "
-            "Tracing will produce a posterized approximation, not extracted "
-            "print-ready vector artwork - that requires the photo-extraction "
-            "pipeline planned for V2."
+            "This looks like a photograph (or heavily textured artwork such as "
+            "fabric or halftone) rather than clean digital artwork. Tracing will "
+            "produce a posterized approximation, not extracted print-ready "
+            "vector artwork - that requires the photo-extraction pipeline "
+            "planned for V2."
         )
 
     # 4-6. Preprocess, vectorize, clean up -----------------------------------

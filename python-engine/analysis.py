@@ -34,6 +34,11 @@ _ANALYSIS_MAX_DIM = 400
 # intentional colour rather than a compression or anti-aliasing artifact.
 _SIGNIFICANT_COLOR_SHARE = 0.004
 
+# Above this texture share an image is treated as a photograph (or halftone).
+# Midway between the most textured artwork measured (0.20, a poster with a
+# photo insert) and the least textured photograph (0.39).
+_PHOTO_TEXTURE_SHARE = 0.30
+
 
 class ImageKind(str, Enum):
     LINE_ART = "line_art"
@@ -73,6 +78,9 @@ class ImageAnalysis:
     # diagnostic only. It briefly gated boundary smoothing; see the note in
     # preprocessing.preprocess for why that was wrong.
     axis_aligned_edge_share: float
+    # Share of pixels that are neither flat colour nor a hard edge - fabric
+    # weave, lighting, grain, halftone. See _texture_share.
+    texture_share: float
     # Border statistics drive background removal.
     border_color: tuple[int, int, int]
     border_uniformity: float
@@ -171,6 +179,23 @@ def _axis_aligned_share(gray: np.ndarray) -> float:
     shares = histogram / total
     # Bins 0,1 and 35 straddle 0/180 deg; bins 17,18,19 straddle 90 deg.
     return float(shares[[0, 1, 17, 18, 19, 35]].sum())
+
+
+def _texture_share(rgb: np.ndarray) -> float:
+    """Fraction of pixels in textured neighbourhoods, on the 400px thumbnail.
+
+    Flat artwork - even a JPEG of it - is mostly perfectly flat regions with
+    variation confined to the edges between them. A photograph has texture
+    nearly everywhere: fabric weave, folds, lighting, sensor grain. Counting
+    pixels whose 5x5 luminance spread is above flat (2 levels) but below a
+    hard edge (12) measures exactly that. Measured over 40 test images: the
+    five photographs 0.39-0.85, a halftone print design 0.57, and every other
+    piece of artwork 0.20 or less.
+    """
+    lum = cv2.cvtColor(np.ascontiguousarray(rgb), cv2.COLOR_RGB2LAB)[..., 0].astype(np.float32)
+    mean = cv2.blur(lum, (5, 5))
+    spread = np.sqrt(np.maximum(cv2.blur(lum * lum, (5, 5)) - mean * mean, 0))
+    return float(((spread >= 2.0) & (spread < 12.0)).mean())
 
 
 def _count_significant_colors(
@@ -287,6 +312,7 @@ def analyze(rgba: np.ndarray) -> ImageAnalysis:
     edges = cv2.Canny(gray, 80, 180)
     edge_density = float((edges > 0).mean())
     axis_aligned_edge_share = _axis_aligned_share(gray)
+    texture_share = _texture_share(rgb)
 
     border_color, border_uniformity = _border_stats(rgb)
     background_is_flat = bool(border_uniformity >= 0.85)
@@ -303,6 +329,7 @@ def analyze(rgba: np.ndarray) -> ImageAnalysis:
         colorfulness=colorfulness,
         edge_density=edge_density,
         background_is_flat=background_is_flat,
+        texture_share=texture_share,
         gray=gray,
         alpha=alpha,
     )
@@ -319,6 +346,7 @@ def analyze(rgba: np.ndarray) -> ImageAnalysis:
         colorfulness=round(colorfulness, 2),
         edge_density=round(edge_density, 4),
         axis_aligned_edge_share=round(axis_aligned_edge_share, 4),
+        texture_share=round(texture_share, 4),
         border_color=border_color,
         border_uniformity=round(border_uniformity, 4),
         background_is_flat=background_is_flat,
@@ -349,6 +377,7 @@ def _classify(
     colorfulness: float,
     edge_density: float,
     background_is_flat: bool,
+    texture_share: float,
     gray: np.ndarray,
     alpha: np.ndarray,
 ) -> tuple[ImageKind, float, list[str]]:
@@ -363,6 +392,18 @@ def _classify(
     if is_grayscale and bimodality > 0.88 and unique_colors < 48:
         notes.append("near-bilevel grayscale with thin strokes")
         return ImageKind.LINE_ART, 0.8, notes
+
+    # --- photograph or heavily textured artwork ---------------------------
+    # The colour-count test below misses most real photos: a JPEG of a
+    # garment has only a few hundred colours. Texture does not - see
+    # _texture_share. A halftone print design lands here too, and should:
+    # tracing it is just as much an approximation.
+    if texture_share > _PHOTO_TEXTURE_SHARE:
+        notes.append(
+            f"textured almost everywhere ({texture_share:.0%} of pixels) - looks like "
+            f"a photograph, fabric or halftone; tracing will approximate it"
+        )
+        return ImageKind.PRODUCT_PHOTO, 0.6, notes
 
     # --- product photo: many colours, soft gradients, no flat background ---
     if unique_colors > 3000 and not background_is_flat and not has_alpha:
