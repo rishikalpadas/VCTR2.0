@@ -34,6 +34,8 @@ import pathstats  # noqa: E402
 from image_io import load_image  # noqa: E402
 from preprocessing import (  # noqa: E402
     _dissolve_edge_films,
+    _merge_close_centers,
+    _rescue_lost_colors,
     _unblend_line_edges,
     preprocess,
 )
@@ -1404,6 +1406,63 @@ class TestBlendColours(unittest.TestCase):
             for entry in outcome.meta["palette"]
         )
         self.assertLess(closest, 25, f"pale blue lost; palette {outcome.meta['palette']}")
+
+
+class TestColoursAreNotLost(unittest.TestCase):
+    """Real colours in the artwork survive quantization."""
+
+    def test_two_large_similar_regions_are_not_fused(self):
+        """A cream daisy beside lilac lettering came back lilac."""
+        centers = np.array([[237, 217, 198], [229, 205, 219], [20, 20, 20]], np.float32)
+        labels = np.array([0] * 400 + [1] * 500 + [2] * 100)
+        kept, _ = _merge_close_centers(centers, labels, 26.0)
+        self.assertEqual(len(kept), 3)
+
+    def test_a_halo_band_is_still_fused(self):
+        centers = np.array([[237, 217, 198], [229, 205, 219], [20, 20, 20]], np.float32)
+        labels = np.array([0] * 20 + [1] * 800 + [2] * 180)  # 2% cream: a halo
+        kept, _ = _merge_close_centers(centers, labels, 26.0)
+        self.assertEqual(len(kept), 2)
+
+    def test_a_colour_missing_from_the_palette_is_rescued(self):
+        img = np.full((400, 600, 3), (18, 26, 53), np.uint8)
+        cv2.rectangle(img, (100, 100), (300, 300), (250, 250, 250), -1)
+        cv2.rectangle(img, (420, 150), (445, 250), (26, 35, 126), -1)  # 1% of pixels
+        visible = np.ones(img.shape[:2], bool)
+        samples = img.reshape(-1, 3).astype(np.float32)
+        centers = np.array([[18, 26, 53], [250, 250, 250]], np.float32)  # no blue
+        assigned = ((samples[:, None] - centers[None]) ** 2).sum(2).argmin(1)
+        centers, assigned, rescued = _rescue_lost_colors(img, visible, samples, centers, assigned, 12)
+        self.assertEqual(rescued, 1)
+        self.assertLess(np.linalg.norm(centers[-1] - [26, 35, 126]), 5)
+
+    def test_edge_blends_are_not_rescued(self):
+        """Anti-aliased pixels between two palette colours are not a colour."""
+        img = np.full((400, 600, 3), (18, 26, 53), np.uint8)
+        cv2.circle(img, (300, 200), 150, (250, 250, 250), -1, cv2.LINE_AA)
+        big = cv2.resize(img, (1200, 800), interpolation=cv2.INTER_CUBIC)
+        visible = np.ones(big.shape[:2], bool)
+        samples = big.reshape(-1, 3).astype(np.float32)
+        centers = np.array([[18, 26, 53], [250, 250, 250]], np.float32)
+        assigned = ((samples[:, None] - centers[None]) ** 2).sum(2).argmin(1)
+        _, _, rescued = _rescue_lost_colors(big, visible, samples, centers, assigned, 12)
+        self.assertEqual(rescued, 0)
+
+    def test_a_small_distinct_element_keeps_its_colour(self):
+        """The blue stroke of an "i" on a navy poster came back navy."""
+        img = np.full((700, 1000, 3), (18, 26, 53), np.uint8)
+        cv2.rectangle(img, (150, 150), (450, 300), (250, 250, 250), -1)
+        cv2.rectangle(img, (550, 150), (850, 300), (200, 155, 5), -1)
+        cv2.rectangle(img, (150, 400), (850, 550), (130, 128, 130), -1)
+        cv2.rectangle(img, (480, 330), (505, 380), (26, 35, 126), -1)  # the blue "i"
+        outcome = vectorize_bytes(
+            png_bytes(Image.fromarray(img)), preset_name="flat_art", overrides={"background": "never"}
+        )
+        palette = [np.array([int(h[i : i + 2], 16) for i in (1, 3, 5)]) for h in outcome.meta["palette"]]
+        blue = min(palette, key=lambda p: np.linalg.norm(p - [26, 35, 126]))
+        # Its own entry: nearer the blue than the navy it used to be painted in.
+        self.assertLess(np.linalg.norm(blue - [26, 35, 126]), np.linalg.norm(blue - [18, 26, 53]))
+        self.assertLess(np.linalg.norm(blue - [26, 35, 126]), 40, f"palette {outcome.meta['palette']}")
 
 
 class TestPaletteIsClosed(unittest.TestCase):

@@ -378,6 +378,11 @@ _ASSIGN_CHUNK = 400_000
 _MIN_EFFECTIVE_SIGMA = 0.8
 
 
+# Largest share of the visible pixels a palette entry can cover and still be
+# treated as a halo by _merge_close_centers.
+_MERGE_HALO_MAX_SHARE = 0.03
+
+
 def _merge_close_centers(
     centers: np.ndarray, labels: np.ndarray, min_separation: float
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -394,6 +399,7 @@ def _merge_close_centers(
         return centers, labels
 
     counts = np.bincount(labels, minlength=centers.shape[0]).astype(np.int64)
+    total = max(int(counts.sum()), 1)
     # remap[i] is the surviving centre index that original centre i now uses.
     remap = np.arange(centers.shape[0])
     alive = np.ones(centers.shape[0], dtype=bool)
@@ -404,6 +410,16 @@ def _merge_close_centers(
         diff = live[:, None, :] - live[None, :, :]
         distances = np.sqrt((diff**2).sum(axis=2))
         np.fill_diagonal(distances, np.inf)
+        # A halo is a thin band, never a large share of the image. Two close
+        # colours that both cover a real area are two regions of the artwork -
+        # a cream daisy beside lilac lettering measured 25.5 apart, just under
+        # the default 26, and the daisy came back lilac. Only fuse those when
+        # they are all but identical.
+        share = counts[live_idx] / total
+        both_large = (share[:, None] >= _MERGE_HALO_MAX_SHARE) & (
+            share[None, :] >= _MERGE_HALO_MAX_SHARE
+        )
+        distances[both_large & (distances >= min_separation / 2)] = np.inf
 
         flat = distances.argmin()
         a, b = np.unravel_index(flat, distances.shape)
@@ -424,6 +440,76 @@ def _merge_close_centers(
     compact = np.zeros(centers.shape[0], dtype=np.int32)
     compact[survivors] = np.arange(survivors.size)
     return centers[survivors], compact[remap][labels]
+
+
+# A flat region further than this (RGB distance) from every palette entry is
+# a colour the palette is missing, not a slightly-off shade of one it has.
+_LOST_COLOR_DISTANCE = 40.0
+# ...and it must cover at least this share of the visible pixels. The blue
+# stroke of a small "i" on a poster measured 0.25%.
+_LOST_COLOR_MIN_SHARE = 0.001
+# A pixel counts as flat when its 5x5 neighbourhood varies by less than this
+# per channel (standard deviation). Anti-aliased edge pixels - the blends
+# between two palette colours, which must never become colours themselves -
+# sit on a steep ramp and fail it.
+_FLAT_MAX_SPREAD = 4.0
+
+
+def _rescue_lost_colors(
+    rgb: np.ndarray,
+    visible_mask: np.ndarray,
+    samples: np.ndarray,
+    centers: np.ndarray,
+    assigned: np.ndarray,
+    max_k: int,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Add palette entries for flat regions k-means left without one.
+
+    k comes from the number of *significant* colours, and a colour covering a
+    small area never counts as significant - so a small but distinct element
+    gets no cluster of its own and is painted in its nearest neighbour: the
+    blue stroke of an "i" on a navy poster came back navy, 74 units away from
+    the colour it actually was. Only flat pixels are considered, so the
+    anti-aliasing blends along every edge can never be promoted to colours.
+    """
+    free = max_k - centers.shape[0]
+    if free <= 0:
+        return centers, assigned, 0
+    image = rgb.astype(np.float32)
+    mean = cv2.blur(image, (5, 5))
+    spread = np.sqrt(np.maximum(cv2.blur(image * image, (5, 5)) - mean * mean, 0)).max(axis=2)
+    flat = (spread < _FLAT_MAX_SPREAD)[visible_mask]
+
+    distance = np.sqrt(((samples - centers[assigned]) ** 2).sum(axis=1))
+    lost = flat & (distance > _LOST_COLOR_DISTANCE)
+    min_pixels = max(50, int(_LOST_COLOR_MIN_SHARE * samples.shape[0]))
+    if lost.sum() < min_pixels:
+        return centers, assigned, 0
+
+    # The missing colours may be several: cluster the lost pixels, then keep
+    # each cluster that is big enough and distinct from everything kept so far.
+    candidates = samples[lost]
+    k = int(min(free, 4, max(1, candidates.shape[0] // min_pixels)))
+    cv2.setRNGSeed(0)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, found = cv2.kmeans(
+        np.ascontiguousarray(candidates), k, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+    )
+    labels = labels.reshape(-1)
+    order = np.argsort(-np.bincount(labels, minlength=k))
+    added = []
+    for index in order:
+        if (labels == index).sum() < min_pixels:
+            continue
+        colour = found[index]
+        existing = np.vstack([centers] + [a[None] for a in added])
+        if np.sqrt(((existing - colour) ** 2).sum(axis=1)).min() <= _LOST_COLOR_DISTANCE:
+            continue
+        added.append(colour)
+    if not added:
+        return centers, assigned, 0
+    centers = np.vstack([centers] + [np.clip(a, 0, 255)[None] for a in added]).astype(np.float32)
+    return centers, _assign(samples, centers), len(added)
 
 
 def _assign(samples: np.ndarray, centers: np.ndarray) -> np.ndarray:
@@ -1004,6 +1090,16 @@ def _quantize(
             # actually nearer, which is what splitting an anti-aliased edge
             # means. Remapping wholesale would shift the whole band one way.
             assigned = _assign(samples, centers)
+
+    centers, assigned, rescued = _rescue_lost_colors(
+        rgb, visible_mask, samples, centers, assigned, params.quantize_max_k
+    )
+    if rescued:
+        log.info(
+            "Rescued %d colour(s) k-means left out: %s",
+            rescued,
+            ", ".join(_to_hex(c.astype(np.uint8)) for c in centers[-rescued:]),
+        )
 
     effective_k = int(centers.shape[0])
     # Write through the uint8 palette rather than converting per assignment, so
