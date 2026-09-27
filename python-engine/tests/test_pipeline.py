@@ -50,6 +50,7 @@ from svg_optimizer import validate_svg  # noqa: E402
 from vectorizer import vectorize_bytes  # noqa: E402
 from engines import centerline  # noqa: E402
 from engines.potrace_engine import (  # noqa: E402
+    _removes_too_much,
     _sharpen_corners,
     _tuck_fills_under_ink,
     _underlap_later_layers,
@@ -1276,6 +1277,23 @@ class TestCornerRestoration(unittest.TestCase):
         # at the square's true corner.
         for target in ([1728.3, 1131.2], [1728.9, 1161.3], [1755.2, 1161.2], [1755.3, 1132.0]):
             self.assertLess(np.linalg.norm(corners - target, axis=1).min(), 1.0)
+
+    @staticmethod
+    def square(inset: float) -> str:
+        a, b = 10 + inset, 90 - inset
+        return f"M {a},{a} L {b},{a} L {b},{b} L {a},{b} Z"
+
+    def test_a_refit_that_cuts_deep_into_the_shape_is_rejected(self):
+        """A re-fit pulling an outline in past the underlying layer is a hole."""
+        self.assertTrue(_removes_too_much(self.square(0), self.square(4), True, cover=1.5))
+
+    def test_a_refit_within_cover_or_adding_material_is_kept(self):
+        self.assertFalse(_removes_too_much(self.square(0), self.square(1), True, cover=1.5))
+        self.assertFalse(_removes_too_much(self.square(4), self.square(0), True, cover=1.5))
+
+    def test_a_counter_that_grows_is_a_cut_into_the_shape(self):
+        """For a counter, material is outside: growing the counter removes it."""
+        self.assertTrue(_removes_too_much(self.square(4), self.square(0), False, cover=1.5))
 
     def test_a_circle_is_left_as_traced(self):
         k = 0.5523 * 20

@@ -148,7 +148,12 @@ class PotraceVectorizer(BaseVectorizer):
 
                 ds = _extract_absolute_path_ds(svg_path.read_text(encoding="utf-8"))
                 if params.corner_snap > 0:
-                    ds = [_sharpen_corners(d, params.corner_snap) for d in ds]
+                    # How far a restored corner may cut into this layer: only
+                    # as far as the layer painted under it is known to reach.
+                    # The ink has every fill tucked ink_tuck under it; a fill
+                    # has only its neighbours' fill_underlap.
+                    cover = params.ink_tuck if i == len(layers) - 1 else params.fill_underlap
+                    ds = [_sharpen_corners(d, params.corner_snap, cover) for d in ds]
                 for d in ds:
                     path_elements.append(f'<path fill="{hex_color}" d="{d}"/>')
                 if ds:
@@ -550,7 +555,7 @@ _SEGMENT_RE = re.compile(r"([MLCZ])([^MLCZ]*)")
 _MIN_CORNER_TURN_DEG = 25.0
 
 
-def _sharpen_corners(d: str, reach: float) -> str:
+def _sharpen_corners(d: str, reach: float, cover: float | None = None) -> str:
     """Put back the corners Potrace rounds between two straight edges.
 
     Potrace picks corners by one threshold (alphamax), and no setting of it is
@@ -562,15 +567,77 @@ def _sharpen_corners(d: str, reach: float) -> str:
     by curves spanning less than ``reach`` pixels, replace those curves with
     the point where the two edges meet. A real arc is never flanked by
     straight edges, so it is left alone.
+
+    A corner that points *out* of the shape only adds material. One that
+    points *in* - a counter's corner, the inside of an L - removes the fill-in
+    Potrace rounded it with, and whatever was under that fill-in shows
+    through. ``cover`` caps how far such a corner may cut in: the distance the
+    layer painted underneath is known to reach, so nothing shows through but
+    that layer. None means no cap.
     """
+    subs = [s for s in re.split(r"(?=M)", d.strip()) if s]
+    # Potrace winds an outline and its holes in opposite directions, so the
+    # material is on the same side of travel for all of them: the side the
+    # largest outline (the outer boundary) encloses.
+    areas = [_signed_area(_sample_outline(_SEGMENT_RE.findall(s))) for s in subs]
+    material = 1.0 if max(areas, key=abs, default=1.0) >= 0 else -1.0
     out = []
-    for sub in re.split(r"(?=M)", d.strip()):
-        if sub:
-            out.append(_sharpen_subpath(sub, reach))
+    for sub, area in zip(subs, areas):
+        sharp = _sharpen_subpath(sub, reach, cover, material)
+        # A ring whose winding matches the material side encloses material;
+        # one wound the other way (a counter) encloses a gap.
+        encloses = (area >= 0) == (material > 0)
+        if sharp != sub and cover is not None and _removes_too_much(sub, sharp, encloses, cover):
+            sharp = sub
+        out.append(sharp)
     return " ".join(out)
 
 
-def _sharpen_subpath(sub: str, reach: float) -> str:
+def _removes_too_much(original: str, sharp: str, encloses: bool, cover: float) -> bool:
+    """Does the re-fit take away material deeper than ``cover`` pixels?
+
+    Checked on the result, not on any one step of the re-fit: a straightened
+    side, a moved corner or a refitted curve can each pull the outline in,
+    and a pull deeper than the layer underneath reaches is a hole in the
+    artwork. Such a subpath keeps Potrace's own outline.
+    """
+    a = _sample_outline(_SEGMENT_RE.findall(original))
+    b = _sample_outline(_SEGMENT_RE.findall(sharp))
+    if a is None or b is None or len(a) < 3 or len(b) < 3:
+        return False
+    lo = np.floor(np.minimum(a.min(0), b.min(0))) - 2
+    hi = np.ceil(np.maximum(a.max(0), b.max(0))) + 2
+    size = (hi - lo).astype(int) + 1
+    if size.prod() > 16_000_000:
+        return False
+
+    def fill(points):
+        mask = np.zeros((size[1], size[0]), np.uint8)
+        cv2.fillPoly(mask, [np.round((points - lo) * 4).astype(np.int32)], 1, lineType=cv2.LINE_8, shift=2)
+        return mask.astype(bool)
+
+    inside_a, inside_b = fill(a), fill(b)
+    # Material before and after: inside a ring that encloses it, outside a
+    # counter.
+    material_a = inside_a if encloses else ~inside_a
+    material_b = inside_b if encloses else ~inside_b
+    lost = material_a & ~material_b
+    if not lost.any():
+        return False
+    depth = cv2.distanceTransform(material_a.astype(np.uint8), cv2.DIST_L2, 3)
+    return float(depth[lost].max()) > cover + 0.5
+
+
+def _signed_area(points: np.ndarray | None) -> float:
+    if points is None or len(points) < 3:
+        return 0.0
+    x, y = points[:, 0], points[:, 1]
+    return float(0.5 * (x @ np.roll(y, -1) - np.roll(x, -1) @ y))
+
+
+def _sharpen_subpath(
+    sub: str, reach: float, cover: float | None = None, material: float = 1.0
+) -> str:
     """Re-fit one closed outline with its corners restored.
 
     Potrace's own segments cannot be used for this: at alphamax 1.0 it draws
@@ -635,7 +702,13 @@ def _sharpen_subpath(sub: str, reach: float) -> str:
         if before is not None and after is not None:
             hit = _intersect(before[0], before[0] + before[1], after[0], after[0] + after[1])
             turn = np.degrees(np.arccos(np.clip(abs(float(before[1] @ after[1])), -1, 1)))
-            if hit is not None and turn >= _MIN_CORNER_TURN_DEG and np.linalg.norm(hit - traced) <= reach:
+            shift = None if hit is None else hit - traced
+            if (
+                hit is not None
+                and turn >= _MIN_CORNER_TURN_DEG
+                and np.linalg.norm(shift) <= reach
+                and (cover is None or not _cuts_in(runs, k, shift, material) or np.linalg.norm(shift) <= cover)
+            ):
                 point = hit
         corner_pts.append(point)
 
@@ -686,6 +759,14 @@ def _sample_outline(tokens) -> np.ndarray | None:
     if np.linalg.norm(points[-1] - points[0]) < 1e-6:
         points = points[:-1]
     return points
+
+
+def _cuts_in(runs, k: int, shift: np.ndarray, material: float) -> bool:
+    """Would moving corner k by ``shift`` move it into the shape's material?"""
+    before, after = runs[k - 1], runs[k]
+    tangent = centerline._unit(after[min(2, len(after) - 1)] - before[max(-3, -len(before))])
+    left = np.array([-tangent[1], tangent[0]])
+    return float(shift @ left) * material > 0
 
 
 def _fit_line(points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
