@@ -40,5 +40,10 @@ class Settings(BaseSettings):
     # diagonal get dropped as tracing noise.
     default_min_path_diagonal_ratio: float = 0.004
 
+    # --- artwork style classifier (optional, see style_classifier.py) -------
+    # Used only when the packages in requirements-ml.txt are installed.
+    # VEC_STYLE_CLASSIFIER=false turns it off even then.
+    style_classifier: bool = True
+
 
 settings = Settings()

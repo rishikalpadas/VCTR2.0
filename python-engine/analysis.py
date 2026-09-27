@@ -469,8 +469,30 @@ KIND_TO_PRESET: dict[ImageKind, str] = {
 }
 
 
-def choose_preset(analysis: ImageAnalysis) -> str:
-    """Map an analysis result onto a preset name for the ``auto`` mode."""
+# A learned "painted" verdict must beat the runner-up style by this much to
+# override the rules. Measured on the labelled set: painted illustrations
+# 0.28-0.29, the closest non-painted image called painted 0.011.
+_PAINTED_MIN_MARGIN = 0.15
+
+
+def choose_preset(analysis: ImageAnalysis, style=None) -> str:
+    """Map an analysis result onto a preset name for the ``auto`` mode.
+
+    ``style`` is an optional ``style_classifier.StylePrediction``. It is used
+    for the one call the rules cannot make: a painted illustration looks like
+    flat artwork to every statistic here, and flattening it to a small
+    palette posterizes its shading. When confidently painted it goes to
+    ``detailed``; everything else keeps the rule-based routing.
+    """
     if analysis.kind_confidence < 0.5:
-        return "standard"
-    return KIND_TO_PRESET.get(analysis.kind, "standard")
+        preset = "standard"
+    else:
+        preset = KIND_TO_PRESET.get(analysis.kind, "standard")
+    if (
+        style is not None
+        and style.style == "painted"
+        and style.margin >= _PAINTED_MIN_MARGIN
+        and preset != "detailed"
+    ):
+        return "detailed"
+    return preset

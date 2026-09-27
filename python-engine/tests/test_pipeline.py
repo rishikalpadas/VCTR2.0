@@ -11,6 +11,7 @@ import io
 import re
 import sys
 import unittest
+import unittest.mock
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -23,7 +24,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
-from analysis import ImageKind, analyze  # noqa: E402
+from analysis import ImageKind, analyze, choose_preset  # noqa: E402
 from errors import (  # noqa: E402
     CorruptImageError,
     InvalidSvgError,
@@ -1565,6 +1566,54 @@ class TestAnalysis(unittest.TestCase):
         )
         self.assertEqual(outcome.meta["preset_used"], "detailed")
         self.assertTrue(any("photograph" in w for w in outcome.meta["warnings"]))
+
+
+class TestStyleRouting(unittest.TestCase):
+    """The learned style verdict overrides the rules for painted art only."""
+
+    @staticmethod
+    def verdict(style: str, margin: float):
+        from style_classifier import StylePrediction
+
+        return StylePrediction(style=style, margin=margin, scores={})
+
+    def flat_analysis(self):
+        return analyze(np.array(keylined_art().convert("RGBA")))
+
+    def test_confidently_painted_art_goes_to_detailed(self):
+        a = self.flat_analysis()
+        self.assertNotEqual(choose_preset(a), "detailed")
+        self.assertEqual(choose_preset(a, self.verdict("painted", 0.28)), "detailed")
+
+    def test_a_hesitant_painted_verdict_changes_nothing(self):
+        a = self.flat_analysis()
+        self.assertEqual(choose_preset(a, self.verdict("painted", 0.05)), choose_preset(a))
+
+    def test_other_verdicts_change_nothing(self):
+        a = self.flat_analysis()
+        for style in ("flat", "photo"):
+            self.assertEqual(choose_preset(a, self.verdict(style, 0.4)), choose_preset(a))
+
+    def test_the_classifier_can_be_switched_off(self):
+        import style_classifier
+
+        saved = dict(style_classifier._state)
+        style_classifier._state.clear()
+        try:
+            with unittest.mock.patch.object(style_classifier.settings, "style_classifier", False):
+                self.assertIsNone(style_classifier.classify(np.zeros((64, 64, 4), np.uint8)))
+        finally:
+            style_classifier._state.clear()
+            style_classifier._state.update(saved)
+
+    def test_weakness_is_flat_to_the_real_classifier(self):
+        import style_classifier
+
+        rgba, _ = load_image((TestLockedOutput.FIXTURES / "weakness.jpeg").read_bytes())
+        verdict = style_classifier.classify(rgba)
+        if verdict is None:
+            self.skipTest("style classifier not installed (requirements-ml.txt)")
+        self.assertEqual(verdict.style, "flat")
 
 
 class TestGeneratedSamples(unittest.TestCase):
