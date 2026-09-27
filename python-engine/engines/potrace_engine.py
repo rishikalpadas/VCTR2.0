@@ -26,12 +26,16 @@ fill="#hex"/>`` elements.
 
 from __future__ import annotations
 
+import os
 import platform
 import re
 import subprocess
 import tempfile
 import time
 import xml.etree.ElementTree as ET
+import threading
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 
 import cv2
@@ -63,6 +67,7 @@ _TOKEN_RE = re.compile(r"([MmLlCcZz])([^MmLlCcZz]*)")
 _NUM_RE = re.compile(r"-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?")
 
 _MIN_LAYER_PIXELS = 4
+_LAYER_WORKERS = max(1, min(8, (os.cpu_count() or 2)))
 _SUBPROCESS_TIMEOUT_S = 20
 
 
@@ -113,11 +118,12 @@ class PotraceVectorizer(BaseVectorizer):
 
         with tempfile.TemporaryDirectory(prefix="potrace_") as tmp:
             tmp_dir = Path(tmp)
-            for i, (hex_color, mask) in enumerate(layers):
+
+            def trace_layer(i: int) -> list[str]:
+                hex_color, mask = layers[i]
                 pgm_path = tmp_dir / f"layer_{i}.pgm"
                 svg_path = tmp_dir / f"layer_{i}.svg"
                 _write_pgm(pgm_path, mask)
-
                 cmd = [
                     str(_POTRACE_EXE),
                     "-s",
@@ -144,20 +150,33 @@ class PotraceVectorizer(BaseVectorizer):
                     ) from exc
 
                 if not svg_path.exists():
-                    continue  # nothing traced for this layer (e.g. fully filtered by turdsize)
+                    return []  # nothing traced (e.g. fully filtered by turdsize)
 
-                ds = _extract_absolute_path_ds(svg_path.read_text(encoding="utf-8"))
-                if params.corner_snap > 0:
-                    # How far a restored corner may cut into this layer: only
-                    # as far as the layer painted under it is known to reach.
-                    # The ink has every fill tucked ink_tuck under it; a fill
-                    # has only its neighbours' fill_underlap.
-                    cover = params.ink_tuck if i == len(layers) - 1 else params.fill_underlap
-                    ds = [_sharpen_corners(d, params.corner_snap, cover) for d in ds]
-                for d in ds:
-                    path_elements.append(f'<path fill="{hex_color}" d="{d}"/>')
-                if ds:
-                    layer_meta.append({"color": hex_color, "subpaths": len(ds)})
+                return _extract_absolute_path_ds(svg_path.read_text(encoding="utf-8"))
+
+            # Layers are independent, so their potrace processes run side by
+            # side. Results are collected in layer order.
+            with ThreadPoolExecutor(max_workers=_LAYER_WORKERS) as pool:
+                traced = list(pool.map(trace_layer, range(len(layers))))
+
+        if params.corner_snap > 0:
+            # How far a restored corner may cut into a layer: only as far as
+            # the layer painted under it is known to reach. The ink has every
+            # fill tucked ink_tuck under it; a fill has only its neighbours'
+            # fill_underlap.
+            jobs = [
+                (d, params.corner_snap, params.ink_tuck if i == len(layers) - 1 else params.fill_underlap)
+                for i, ds in enumerate(traced)
+                for d in ds
+            ]
+            sharpened = iter(_run_sharpen_jobs(jobs))
+            traced = [[next(sharpened) for _ in ds] for ds in traced]
+
+        for (hex_color, _), ds in zip(layers, traced):
+            for d in ds:
+                path_elements.append(f'<path fill="{hex_color}" d="{d}"/>')
+            if ds:
+                layer_meta.append({"color": hex_color, "subpaths": len(ds)})
 
         path_elements.extend(strokes)
 
@@ -548,6 +567,39 @@ def _transform_path_d(d: str, tx: float, ty: float, sx: float, sy: float) -> str
 # ---------------------------------------------------------------------------
 # Corner restoration
 # ---------------------------------------------------------------------------
+
+# Corner restoration is pure-Python geometry and dominates a Potrace trace of
+# busy artwork (measured: ~85% of a 90s trace). Threads cannot share that
+# work, so large jobs go to a pool of worker processes, started once and
+# reused. Every path is restored by the same function either way, so the
+# output does not depend on where it ran. Below the threshold the start-up
+# cost of the pool is not worth it.
+_PROCESS_JOB_THRESHOLD = 200
+_process_pool = None
+_process_pool_lock = threading.Lock()
+
+
+def _sharpen_job(job: tuple[str, float, float]) -> str:
+    d, reach, cover = job
+    return _sharpen_corners(d, reach, cover)
+
+
+def _run_sharpen_jobs(jobs: list[tuple[str, float, float]]) -> list[str]:
+    global _process_pool
+    if len(jobs) < _PROCESS_JOB_THRESHOLD or _LAYER_WORKERS < 2:
+        return [_sharpen_job(job) for job in jobs]
+    with _process_pool_lock:
+        if _process_pool is None:
+            _process_pool = ProcessPoolExecutor(max_workers=_LAYER_WORKERS)
+    try:
+        chunk = max(1, len(jobs) // (_LAYER_WORKERS * 4))
+        return list(_process_pool.map(_sharpen_job, jobs, chunksize=chunk))
+    except BrokenProcessPool:
+        # A worker died (killed, out of memory): finish here rather than fail.
+        with _process_pool_lock:
+            _process_pool = None
+        log.warning("Corner-restoration worker pool broke; finishing in-process")
+        return [_sharpen_job(job) for job in jobs]
 
 _SEGMENT_RE = re.compile(r"([MLCZ])([^MLCZ]*)")
 # Two edges must turn by at least this much to meet at a corner; below it
