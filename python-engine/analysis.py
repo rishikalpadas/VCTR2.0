@@ -39,6 +39,19 @@ _SIGNIFICANT_COLOR_SHARE = 0.004
 # photo insert) and the least textured photograph (0.39).
 _PHOTO_TEXTURE_SHARE = 0.30
 
+# Flat artwork with a fabric/canvas texture filter laid over it is "textured
+# almost everywhere" too, but it is not a photograph: the grain is fine,
+# low-contrast noise sitting on flat colour. Three things together tell it
+# apart, measured over the test set:
+#   - texture left after a 3x3 median: textured art 0.10-0.12, real photos
+#     0.21-0.58 (the grain goes, folds and lighting stay);
+#   - a flat background border;
+#   - vivid colour: textured art 58-84, photographs of garments 12-30.
+# The synthetic weave in the tests loses its texture to the median too
+# (0.01), which is why the other two are required as well.
+_TEXTURED_ART_MAX_RESIDUAL = 0.15
+_TEXTURED_ART_MIN_COLORFULNESS = 40.0
+
 
 class ImageKind(str, Enum):
     LINE_ART = "line_art"
@@ -81,6 +94,9 @@ class ImageAnalysis:
     # Share of pixels that are neither flat colour nor a hard edge - fabric
     # weave, lighting, grain, halftone. See _texture_share.
     texture_share: float
+    # The same measure after a 3x3 median: what is left once fine grain is
+    # removed. Low while texture_share is high = a texture overlay on flat art.
+    texture_after_smoothing: float
     # Border statistics drive background removal.
     border_color: tuple[int, int, int]
     border_uniformity: float
@@ -313,6 +329,7 @@ def analyze(rgba: np.ndarray) -> ImageAnalysis:
     edge_density = float((edges > 0).mean())
     axis_aligned_edge_share = _axis_aligned_share(gray)
     texture_share = _texture_share(rgb)
+    texture_after_smoothing = _texture_share(cv2.medianBlur(np.ascontiguousarray(rgb), 3))
 
     border_color, border_uniformity = _border_stats(rgb)
     background_is_flat = bool(border_uniformity >= 0.85)
@@ -330,6 +347,7 @@ def analyze(rgba: np.ndarray) -> ImageAnalysis:
         edge_density=edge_density,
         background_is_flat=background_is_flat,
         texture_share=texture_share,
+        texture_after_smoothing=texture_after_smoothing,
         gray=gray,
         alpha=alpha,
     )
@@ -347,6 +365,7 @@ def analyze(rgba: np.ndarray) -> ImageAnalysis:
         edge_density=round(edge_density, 4),
         axis_aligned_edge_share=round(axis_aligned_edge_share, 4),
         texture_share=round(texture_share, 4),
+        texture_after_smoothing=round(texture_after_smoothing, 4),
         border_color=border_color,
         border_uniformity=round(border_uniformity, 4),
         background_is_flat=background_is_flat,
@@ -378,6 +397,7 @@ def _classify(
     edge_density: float,
     background_is_flat: bool,
     texture_share: float,
+    texture_after_smoothing: float,
     gray: np.ndarray,
     alpha: np.ndarray,
 ) -> tuple[ImageKind, float, list[str]]:
@@ -398,6 +418,20 @@ def _classify(
     # garment has only a few hundred colours. Texture does not - see
     # _texture_share. A halftone print design lands here too, and should:
     # tracing it is just as much an approximation.
+    if (
+        texture_share > _PHOTO_TEXTURE_SHARE
+        and texture_after_smoothing < _TEXTURED_ART_MAX_RESIDUAL
+        and background_is_flat
+        and colorfulness > _TEXTURED_ART_MIN_COLORFULNESS
+    ):
+        # Tracing the grain as detail produced ~14,000 paths and ran past the
+        # request timeout; as flat art the same image is ~35 paths.
+        notes.append(
+            f"texture overlay on flat artwork ({texture_share:.0%} textured, "
+            f"{texture_after_smoothing:.0%} after smoothing) - traced as flat art"
+        )
+        return ImageKind.FLAT_GRAPHIC, 0.7, notes
+
     if texture_share > _PHOTO_TEXTURE_SHARE:
         notes.append(
             f"textured almost everywhere ({texture_share:.0%} of pixels) - looks like "

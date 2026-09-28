@@ -1578,6 +1578,35 @@ class TestAnalysis(unittest.TestCase):
         self.assertNotEqual(result.kind, ImageKind.PRODUCT_PHOTO)
         self.assertLess(result.texture_share, 0.3)
 
+    @staticmethod
+    def textured_flat_art() -> np.ndarray:
+        """Flat cartoon artwork with a canvas-texture filter over everything."""
+        h, w = 600, 800
+        img = np.full((h, w, 3), (163, 213, 216), np.uint8)  # flat sky-blue background
+        cv2.rectangle(img, (420, 120), (640, 420), (230, 60, 30), -1)   # red cab
+        cv2.rectangle(img, (180, 260), (440, 420), (40, 40, 45), -1)    # black boiler
+        for cx in (260, 380, 540):
+            cv2.circle(img, (cx, 470), 70, (30, 90, 220), -1)             # blue wheels
+        cv2.rectangle(img, (420, 120), (640, 420), (0, 0, 0), 10)       # black outlines
+        cv2.rectangle(img, (180, 260), (440, 420), (0, 0, 0), 10)
+        grain = np.random.default_rng(2).normal(0, 6, (h, w, 1))
+        img = np.clip(img.astype(np.float32) + grain, 0, 255).astype(np.uint8)
+        return np.dstack([img, np.full((h, w), 255, np.uint8)])
+
+    def test_textured_flat_art_is_not_a_photo(self):
+        """A texture overlay on flat art was traced as a photo: ~14,000 paths, timeout."""
+        result = analyze(self.textured_flat_art())
+        self.assertGreater(result.texture_share, 0.3)
+        self.assertLess(result.texture_after_smoothing, 0.15)
+        self.assertEqual(result.kind, ImageKind.FLAT_GRAPHIC)
+        self.assertEqual(choose_preset(result), "flat_art")
+
+    def test_fabric_photo_stays_a_photo_even_though_smoothing_removes_its_weave(self):
+        """Garment photos are dull and have no flat background; smoothing alone is not enough."""
+        result = analyze(self.fabric_photo())
+        self.assertLess(result.texture_after_smoothing, 0.15)
+        self.assertEqual(result.kind, ImageKind.PRODUCT_PHOTO)
+
     def test_photos_get_the_approximation_warning(self):
         outcome = vectorize_bytes(
             png_bytes(Image.fromarray(self.fabric_photo()[..., :3])), preset_name="auto"
