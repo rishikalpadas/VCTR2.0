@@ -11,6 +11,7 @@ import io
 import re
 import sys
 import unittest
+import unittest.mock
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -23,7 +24,7 @@ import cv2  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw  # noqa: E402
 
-from analysis import ImageKind, analyze  # noqa: E402
+from analysis import ImageKind, analyze, choose_preset  # noqa: E402
 from errors import (  # noqa: E402
     CorruptImageError,
     InvalidSvgError,
@@ -34,6 +35,8 @@ import pathstats  # noqa: E402
 from image_io import load_image  # noqa: E402
 from preprocessing import (  # noqa: E402
     _dissolve_edge_films,
+    _merge_close_centers,
+    _rescue_lost_colors,
     _unblend_line_edges,
     preprocess,
 )
@@ -47,6 +50,7 @@ from svg_optimizer import validate_svg  # noqa: E402
 from vectorizer import vectorize_bytes  # noqa: E402
 from engines import centerline  # noqa: E402
 from engines.potrace_engine import (  # noqa: E402
+    _removes_too_much,
     _sharpen_corners,
     _tuck_fills_under_ink,
     _underlap_later_layers,
@@ -1274,6 +1278,23 @@ class TestCornerRestoration(unittest.TestCase):
         for target in ([1728.3, 1131.2], [1728.9, 1161.3], [1755.2, 1161.2], [1755.3, 1132.0]):
             self.assertLess(np.linalg.norm(corners - target, axis=1).min(), 1.0)
 
+    @staticmethod
+    def square(inset: float) -> str:
+        a, b = 10 + inset, 90 - inset
+        return f"M {a},{a} L {b},{a} L {b},{b} L {a},{b} Z"
+
+    def test_a_refit_that_cuts_deep_into_the_shape_is_rejected(self):
+        """A re-fit pulling an outline in past the underlying layer is a hole."""
+        self.assertTrue(_removes_too_much(self.square(0), self.square(4), True, cover=1.5))
+
+    def test_a_refit_within_cover_or_adding_material_is_kept(self):
+        self.assertFalse(_removes_too_much(self.square(0), self.square(1), True, cover=1.5))
+        self.assertFalse(_removes_too_much(self.square(4), self.square(0), True, cover=1.5))
+
+    def test_a_counter_that_grows_is_a_cut_into_the_shape(self):
+        """For a counter, material is outside: growing the counter removes it."""
+        self.assertTrue(_removes_too_much(self.square(4), self.square(0), False, cover=1.5))
+
     def test_a_circle_is_left_as_traced(self):
         k = 0.5523 * 20
         circle = (
@@ -1406,6 +1427,63 @@ class TestBlendColours(unittest.TestCase):
         self.assertLess(closest, 25, f"pale blue lost; palette {outcome.meta['palette']}")
 
 
+class TestColoursAreNotLost(unittest.TestCase):
+    """Real colours in the artwork survive quantization."""
+
+    def test_two_large_similar_regions_are_not_fused(self):
+        """A cream daisy beside lilac lettering came back lilac."""
+        centers = np.array([[237, 217, 198], [229, 205, 219], [20, 20, 20]], np.float32)
+        labels = np.array([0] * 400 + [1] * 500 + [2] * 100)
+        kept, _ = _merge_close_centers(centers, labels, 26.0)
+        self.assertEqual(len(kept), 3)
+
+    def test_a_halo_band_is_still_fused(self):
+        centers = np.array([[237, 217, 198], [229, 205, 219], [20, 20, 20]], np.float32)
+        labels = np.array([0] * 20 + [1] * 800 + [2] * 180)  # 2% cream: a halo
+        kept, _ = _merge_close_centers(centers, labels, 26.0)
+        self.assertEqual(len(kept), 2)
+
+    def test_a_colour_missing_from_the_palette_is_rescued(self):
+        img = np.full((400, 600, 3), (18, 26, 53), np.uint8)
+        cv2.rectangle(img, (100, 100), (300, 300), (250, 250, 250), -1)
+        cv2.rectangle(img, (420, 150), (445, 250), (26, 35, 126), -1)  # 1% of pixels
+        visible = np.ones(img.shape[:2], bool)
+        samples = img.reshape(-1, 3).astype(np.float32)
+        centers = np.array([[18, 26, 53], [250, 250, 250]], np.float32)  # no blue
+        assigned = ((samples[:, None] - centers[None]) ** 2).sum(2).argmin(1)
+        centers, assigned, rescued = _rescue_lost_colors(img, visible, samples, centers, assigned, 12)
+        self.assertEqual(rescued, 1)
+        self.assertLess(np.linalg.norm(centers[-1] - [26, 35, 126]), 5)
+
+    def test_edge_blends_are_not_rescued(self):
+        """Anti-aliased pixels between two palette colours are not a colour."""
+        img = np.full((400, 600, 3), (18, 26, 53), np.uint8)
+        cv2.circle(img, (300, 200), 150, (250, 250, 250), -1, cv2.LINE_AA)
+        big = cv2.resize(img, (1200, 800), interpolation=cv2.INTER_CUBIC)
+        visible = np.ones(big.shape[:2], bool)
+        samples = big.reshape(-1, 3).astype(np.float32)
+        centers = np.array([[18, 26, 53], [250, 250, 250]], np.float32)
+        assigned = ((samples[:, None] - centers[None]) ** 2).sum(2).argmin(1)
+        _, _, rescued = _rescue_lost_colors(big, visible, samples, centers, assigned, 12)
+        self.assertEqual(rescued, 0)
+
+    def test_a_small_distinct_element_keeps_its_colour(self):
+        """The blue stroke of an "i" on a navy poster came back navy."""
+        img = np.full((700, 1000, 3), (18, 26, 53), np.uint8)
+        cv2.rectangle(img, (150, 150), (450, 300), (250, 250, 250), -1)
+        cv2.rectangle(img, (550, 150), (850, 300), (200, 155, 5), -1)
+        cv2.rectangle(img, (150, 400), (850, 550), (130, 128, 130), -1)
+        cv2.rectangle(img, (480, 330), (505, 380), (26, 35, 126), -1)  # the blue "i"
+        outcome = vectorize_bytes(
+            png_bytes(Image.fromarray(img)), preset_name="flat_art", overrides={"background": "never"}
+        )
+        palette = [np.array([int(h[i : i + 2], 16) for i in (1, 3, 5)]) for h in outcome.meta["palette"]]
+        blue = min(palette, key=lambda p: np.linalg.norm(p - [26, 35, 126]))
+        # Its own entry: nearer the blue than the navy it used to be painted in.
+        self.assertLess(np.linalg.norm(blue - [26, 35, 126]), np.linalg.norm(blue - [18, 26, 53]))
+        self.assertLess(np.linalg.norm(blue - [26, 35, 126]), 40, f"palette {outcome.meta['palette']}")
+
+
 class TestPaletteIsClosed(unittest.TestCase):
     def test_every_fill_comes_from_the_quantized_palette(self):
         """VTracer averages each layer's colour, so one yellow in the artwork
@@ -1473,6 +1551,87 @@ class TestAnalysis(unittest.TestCase):
         ImageDraw.Draw(image).rectangle((50, 50, 150, 150), fill=(10, 200, 90, 255))
         result = analyze(np.array(image))
         self.assertTrue(result.has_alpha)
+
+    @staticmethod
+    def fabric_photo() -> np.ndarray:
+        """A logo printed on cloth: few colours, but texture everywhere."""
+        h, w = 600, 800
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        light = 30 * np.sin(xx / 170) * np.cos(yy / 230)  # folds / lighting
+        weave = np.random.default_rng(1).normal(0, 4, (h, w))
+        base = np.stack([185 + light + weave, 160 + light + weave, 130 + light + weave], axis=2)
+        img = np.clip(base, 0, 255).astype(np.uint8)
+        cv2.putText(img, "USPA", (140, 360), cv2.FONT_HERSHEY_TRIPLEX, 6, (235, 232, 220), 18, cv2.LINE_AA)
+        return np.dstack([img, np.full((h, w), 255, np.uint8)])
+
+    def test_a_photo_with_few_colours_is_still_a_photo(self):
+        """Colour count alone missed every garment photo in the test set."""
+        result = analyze(self.fabric_photo())
+        self.assertEqual(result.kind, ImageKind.PRODUCT_PHOTO)
+        self.assertGreater(result.texture_share, 0.3)
+
+    def test_a_jpeg_of_flat_art_is_not_a_photo(self):
+        buf = io.BytesIO()
+        keylined_art().convert("RGB").save(buf, "JPEG", quality=85)
+        rgba, _ = load_image(buf.getvalue())
+        result = analyze(rgba)
+        self.assertNotEqual(result.kind, ImageKind.PRODUCT_PHOTO)
+        self.assertLess(result.texture_share, 0.3)
+
+    def test_photos_get_the_approximation_warning(self):
+        outcome = vectorize_bytes(
+            png_bytes(Image.fromarray(self.fabric_photo()[..., :3])), preset_name="auto"
+        )
+        self.assertEqual(outcome.meta["preset_used"], "detailed")
+        self.assertTrue(any("photograph" in w for w in outcome.meta["warnings"]))
+
+
+class TestStyleRouting(unittest.TestCase):
+    """The learned style verdict overrides the rules for painted art only."""
+
+    @staticmethod
+    def verdict(style: str, margin: float):
+        from style_classifier import StylePrediction
+
+        return StylePrediction(style=style, margin=margin, scores={})
+
+    def flat_analysis(self):
+        return analyze(np.array(keylined_art().convert("RGBA")))
+
+    def test_confidently_painted_art_goes_to_detailed(self):
+        a = self.flat_analysis()
+        self.assertNotEqual(choose_preset(a), "detailed")
+        self.assertEqual(choose_preset(a, self.verdict("painted", 0.28)), "detailed")
+
+    def test_a_hesitant_painted_verdict_changes_nothing(self):
+        a = self.flat_analysis()
+        self.assertEqual(choose_preset(a, self.verdict("painted", 0.05)), choose_preset(a))
+
+    def test_other_verdicts_change_nothing(self):
+        a = self.flat_analysis()
+        for style in ("flat", "photo"):
+            self.assertEqual(choose_preset(a, self.verdict(style, 0.4)), choose_preset(a))
+
+    def test_the_classifier_can_be_switched_off(self):
+        import style_classifier
+
+        saved = dict(style_classifier._state)
+        style_classifier._state.clear()
+        try:
+            with unittest.mock.patch.object(style_classifier.settings, "style_classifier", False):
+                self.assertIsNone(style_classifier.classify(np.zeros((64, 64, 4), np.uint8)))
+        finally:
+            style_classifier._state.clear()
+            style_classifier._state.update(saved)
+
+    def test_weakness_is_flat_to_the_real_classifier(self):
+        import style_classifier
+
+        rgba, _ = load_image((TestLockedOutput.FIXTURES / "weakness.jpeg").read_bytes())
+        verdict = style_classifier.classify(rgba)
+        if verdict is None:
+            self.skipTest("style classifier not installed (requirements-ml.txt)")
+        self.assertEqual(verdict.style, "flat")
 
 
 class TestGeneratedSamples(unittest.TestCase):

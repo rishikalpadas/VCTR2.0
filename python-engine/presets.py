@@ -566,7 +566,11 @@ PRESETS: dict[str, Preset] = {
         ),
         optimize=OptimizeParams(
             min_path_diagonal_ratio=0.002,
-            significant_digits=6,  # dense artwork: keep every bit of curve
+            # 5 is ~0.03px on a 3000px trace - below what a render can show -
+            # and measured 15-20% smaller than 6 on busy artwork with no RMSE
+            # change. Do not go to 4: that snaps coordinates over 1000 to
+            # whole pixels (see significant_digits above).
+            significant_digits=5,
         ),
     ),
 }

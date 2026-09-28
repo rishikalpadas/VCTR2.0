@@ -1,0 +1,26 @@
+# ---------------------------------------------------------------------------
+# OPTIONAL: artwork style classifier (see style_classifier.py)
+#
+# Lets the auto preset recognise painted / gradient-shaded illustrations and
+# route them to the "detailed" preset instead of flattening them to a small
+# palette. Without these packages the engine runs exactly as before, using
+# the rule-based analysis only.
+#
+# CPU only. Install AFTER requirements.txt, into the same venv:
+#
+#   pip install -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
+#
+# Footprint: ~660 MB of packages, plus ~580 MB of model weights downloaded
+# once on first use into the Hugging Face cache (HF_HOME, default
+# %USERPROFILE%\.cache\huggingface). The weights are the LAION ViT-B-32 CLIP
+# checkpoint in safetensors format - loading them never executes code.
+# ---------------------------------------------------------------------------
+
+torch==2.14.0
+torchvision==0.29.0
+open_clip_torch==3.3.0
+huggingface_hub==2.0.0
+safetensors==0.8.0
+timm==1.0.30
+ftfy
+regex

@@ -19,6 +19,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field, replace
 
+import style_classifier
 from analysis import ImageKind, analyze, choose_preset
 from engines import registry
 from errors import EngineError, VectorizationError
@@ -68,12 +69,15 @@ def vectorize_bytes(
 
     # 3. Resolve the preset -------------------------------------------------
     requested = preset_name or AUTO_PRESET_NAME
+    style = None
     if requested == AUTO_PRESET_NAME:
-        resolved_name = choose_preset(analysis)
+        style = style_classifier.classify(rgba)
+        resolved_name = choose_preset(analysis, style)
         log.info(
-            "Auto preset: kind=%s (conf %.2f) -> preset=%s",
+            "Auto preset: kind=%s (conf %.2f) style=%s -> preset=%s",
             analysis.kind.value,
             analysis.kind_confidence,
+            f"{style.style} (margin {style.margin:.2f})" if style else "n/a",
             resolved_name,
         )
     else:
@@ -83,10 +87,11 @@ def vectorize_bytes(
 
     if analysis.kind in _APPROXIMATION_KINDS:
         warnings.append(
-            "This looks like a photograph rather than clean digital artwork. "
-            "Tracing will produce a posterized approximation, not extracted "
-            "print-ready vector artwork - that requires the photo-extraction "
-            "pipeline planned for V2."
+            "This looks like a photograph (or heavily textured artwork such as "
+            "fabric or halftone) rather than clean digital artwork. Tracing will "
+            "produce a posterized approximation, not extracted print-ready "
+            "vector artwork - that requires the photo-extraction pipeline "
+            "planned for V2."
         )
 
     # 4-6. Preprocess, vectorize, clean up -----------------------------------
@@ -170,6 +175,8 @@ def vectorize_bytes(
     }
     if smoothing_report is not None:
         meta["smoothing"] = smoothing_report
+    if style is not None:
+        meta["style"] = style.to_dict()
 
     log.info(
         "Done in %.0f ms: preset=%s paths=%d size=%.1f KB",

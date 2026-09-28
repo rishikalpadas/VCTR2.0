@@ -60,6 +60,23 @@ Expect: `Image-to-Vector API  http://127.0.0.1:5000`
 Open <http://127.0.0.1:5000> and upload an image. The badge under the title
 turns green when the engine is reachable.
 
+### Optional: learned style classifier
+
+Lets `auto` recognise painted / gradient-shaded illustrations and send them
+to the `detailed` preset instead of flattening them to a small palette. Skip
+it and everything works as before on the rule-based analysis alone.
+
+```bat
+cd python-engine
+venv\Scripts\activate
+pip install -r requirements-ml.txt --extra-index-url https://download.pytorch.org/whl/cpu
+```
+
+About 660 MB of packages (CPU PyTorch + open_clip) and a ~580 MB model
+download on first use (LAION CLIP ViT-B-32, safetensors). Turn it off with
+`VEC_STYLE_CLASSIFIER=false`. Rebuild its reference file from labelled
+images with `python tools\train_style_classifier.py <folder>`.
+
 > **Use Python 3.12 or 3.13, not 3.14.** VTracer publishes wheels up to
 > CPython 3.13. On 3.14 pip tries to build the Rust core from source and fails
 > unless you have a Rust toolchain. Check with `py -0p`.
