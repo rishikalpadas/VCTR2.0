@@ -29,6 +29,7 @@ from schemas import (
     PresetListResponse,
     VectorizeResponse,
 )
+from vector_import import import_to_svg
 from vectorizer import describe_engines, vectorize_bytes
 
 VERSION = "1.0.0"
@@ -176,6 +177,27 @@ async def export_pdf(file: UploadFile = File(..., description="SVG document")):
 
     pdf = svg_to_pdf(svg)
     return Response(content=pdf, media_type="application/pdf")
+
+
+@app.post(
+    "/import",
+    responses={
+        400: {"model": ErrorResponse},
+        415: {"model": ErrorResponse},
+        422: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+)
+async def import_vector(file: UploadFile = File(..., description="PDF, AI or CDR file")):
+    """Convert a PDF / Illustrator / CorelDRAW file into SVG for separation."""
+    data = await file.read()
+    if len(data) > settings.max_upload_bytes:
+        raise ImageTooLargeError(
+            f"File is larger than the "
+            f"{settings.max_upload_bytes // (1024 * 1024)} MB limit."
+        )
+    outcome = import_to_svg(data)
+    return {"success": True, "svg": outcome.svg, "meta": outcome.meta}
 
 
 if __name__ == "__main__":

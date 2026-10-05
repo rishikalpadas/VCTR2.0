@@ -42,3 +42,9 @@ scour==0.38.2
 # install.
 svglib==2.2.0
 reportlab==5.0.1
+
+# --- Vector file import (PDF / AI / CDR -> SVG) ----------------------------
+# Needs the Inkscape CLI on the host (not a pip package). Linux:
+#   sudo apt install inkscape      (Debian/Ubuntu builds include CDR via libcdr)
+# Override the binary location with VEC_INKSCAPE_BIN. Without Inkscape the
+# /import endpoint answers 503 and the rest of the engine is unaffected.
