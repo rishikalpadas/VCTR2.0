@@ -1,0 +1,98 @@
+
+> image-to-vector-server@1.0.0 start
+> node server.js
+
+17:42:37.767 INFO  -----------------------------------------------------------
+17:42:37.768 INFO    Image-to-Vector API  http://127.0.0.1:5000
+17:42:37.768 INFO    Frontend             http://127.0.0.1:5000/
+17:42:37.768 INFO    Python engine        http://127.0.0.1:8000
+17:42:37.768 INFO  -----------------------------------------------------------
+17:42:46.453 INFO  GET /api/health 200 29ms
+17:43:02.267 INFO  GET / 304 1ms
+17:43:02.318 INFO  GET /style.css 304 1ms
+17:43:02.319 INFO  GET /app.js 304 0ms
+17:43:02.347 INFO  GET /api/health 200 6ms
+17:43:02.406 INFO  GET /style.css 304 1ms
+17:43:17.352 INFO  GET /api/health 200 3ms
+17:43:32.362 INFO  GET /api/health 200 6ms
+17:43:47.354 INFO  GET /api/health 200 3ms
+17:44:02.354 INFO  GET /api/health 200 5ms
+17:44:17.382 INFO  GET /api/health 200 23ms
+17:44:32.385 INFO  GET /api/health 200 25ms
+17:44:47.377 INFO  GET /api/health 200 21ms
+17:45:02.364 INFO  GET /api/health 200 14ms
+17:45:17.365 INFO  GET /api/health 200 12ms
+17:45:32.362 INFO  GET /api/health 200 13ms
+17:45:47.374 INFO  GET /api/health 200 19ms
+17:46:02.359 INFO  GET /api/health 200 10ms
+17:46:17.365 INFO  GET /api/health 200 11ms
+17:46:32.367 INFO  GET /api/health 200 12ms
+17:46:47.362 INFO  GET /api/health 200 12ms
+17:47:02.364 INFO  GET /api/health 200 12ms
+17:47:17.358 INFO  GET /api/health 200 11ms
+17:47:32.357 INFO  GET /api/health 200 10ms
+17:47:47.387 INFO  GET /api/health 200 16ms
+17:48:02.368 INFO  GET /api/health 200 13ms
+17:48:17.364 INFO  GET /api/health 200 11ms
+17:48:32.361 INFO  GET /api/health 200 11ms
+17:48:47.623 INFO  GET /api/health 200 275ms
+17:49:02.397 INFO  GET /api/health 200 32ms
+17:49:17.386 INFO  GET /api/health 200 25ms
+17:49:32.365 INFO  GET /api/health 200 11ms
+17:49:47.380 INFO  GET /api/health 200 14ms
+17:50:02.369 INFO  GET /api/health 200 12ms
+17:50:17.362 INFO  GET /api/health 200 11ms
+17:50:32.369 INFO  GET /api/health 200 11ms
+17:50:47.371 INFO  GET /api/health 200 11ms
+17:51:02.368 INFO  GET /api/health 200 10ms
+17:51:17.366 INFO  GET /api/health 200 13ms
+17:51:32.364 INFO  GET /api/health 200 10ms
+17:51:47.367 INFO  GET /api/health 200 10ms
+17:52:02.374 INFO  GET /api/health 200 15ms
+17:52:17.360 INFO  GET /api/health 200 9ms
+17:52:32.361 INFO  GET /api/health 200 10ms
+17:52:47.369 INFO  GET /api/health 200 10ms
+17:53:02.366 INFO  GET /api/health 200 11ms
+17:53:17.357 INFO  GET /api/health 200 11ms
+17:53:32.365 INFO  GET /api/health 200 9ms
+17:53:47.360 INFO  GET /api/health 200 13ms
+17:54:02.371 INFO  GET /api/health 200 12ms
+17:54:17.358 INFO  GET /api/health 200 10ms
+17:54:32.369 INFO  GET /api/health 200 11ms
+17:54:47.362 INFO  GET /api/health 200 10ms
+17:55:02.359 INFO  GET /api/health 200 10ms
+17:55:17.346 INFO  GET /api/health 200 1ms
+17:55:32.346 INFO  GET /api/health 200 8ms
+17:55:47.346 INFO  GET /api/health 200 8ms
+17:56:02.361 INFO  GET /api/health 200 11ms
+17:56:17.362 INFO  GET /api/health 200 23ms
+17:56:32.365 INFO  GET /api/health 200 12ms
+17:56:47.363 INFO  GET /api/health 200 10ms
+17:57:02.361 INFO  GET /api/health 200 10ms
+17:57:17.363 INFO  GET /api/health 200 9ms
+17:57:32.350 INFO  GET /api/health 200 5ms
+17:57:47.363 INFO  GET /api/health 200 11ms
+17:58:02.363 INFO  GET /api/health 200 11ms
+17:58:17.367 INFO  GET /api/health 200 17ms
+17:58:32.372 INFO  GET /api/health 200 12ms
+17:58:47.360 INFO  GET /api/health 200 6ms
+17:59:02.372 INFO  GET /api/health 200 10ms
+17:59:17.374 INFO  GET /api/health 200 11ms
+17:59:32.367 INFO  GET /api/health 200 11ms
+17:59:47.365 INFO  GET /api/health 200 9ms
+18:00:02.365 INFO  GET /api/health 200 10ms
+18:00:17.368 INFO  GET /api/health 200 10ms
+18:00:32.365 INFO  GET /api/health 200 9ms
+18:00:47.358 INFO  GET /api/health 200 6ms
+18:01:02.359 INFO  GET /api/health 200 9ms
+18:01:17.364 INFO  GET /api/health 200 6ms
+18:01:32.371 INFO  GET /api/health 200 10ms
+18:01:47.355 INFO  GET /api/health 200 6ms
+18:02:02.358 INFO  GET /api/health 200 7ms
+18:02:17.346 INFO  GET /api/health 200 2ms
+18:02:32.958 INFO  GET /api/health 200 8ms
+18:02:47.955 INFO  GET /api/health 200 9ms
+18:03:02.977 INFO  GET /api/health 200 16ms
+18:03:17.948 INFO  GET /api/health 200 8ms
+18:03:32.350 INFO  GET /api/health 200 3ms
+18:03:47.348 INFO  GET /api/health 200 3ms

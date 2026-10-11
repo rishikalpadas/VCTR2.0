@@ -14,14 +14,15 @@ import json
 import time
 
 import uvicorn
-from fastapi import FastAPI, File, Form, Request, UploadFile
+from fastapi import FastAPI, File, Form, Query, Request, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, Response
 
 from config import settings
 from errors import ImageTooLargeError, InvalidSvgError, VectorizationError
 from logging_config import configure_logging, get_logger
 from presets import list_presets
-from svg_export import svg_to_pdf
+from svg_export import svg_to_pdf, svg_to_separations_pdf
 from schemas import (
     EngineListResponse,
     ErrorResponse,
@@ -29,6 +30,7 @@ from schemas import (
     PresetListResponse,
     VectorizeResponse,
 )
+from vector_import import import_vector_file
 from vectorizer import describe_engines, vectorize_bytes
 
 VERSION = "1.0.0"
@@ -160,8 +162,15 @@ async def vectorize(
         500: {"model": ErrorResponse},
     },
 )
-async def export_pdf(file: UploadFile = File(..., description="SVG document")):
-    """Convert a generated SVG into a single-page vector PDF.
+async def export_pdf(
+    file: UploadFile = File(..., description="SVG document"),
+    separations: bool = Query(False, description="One page per colour"),
+    knockout: bool = Query(True, description="Separations only: cut covered areas"),
+):
+    """Convert a generated SVG into a vector PDF.
+
+    A single page by default; with ``separations`` one page per ink, darkest
+    first, for screen printing - see ``svg_export.svg_to_separations_pdf``.
 
     Takes the SVG rather than re-tracing the original raster: the export then
     matches exactly what the user previewed, and costs milliseconds instead of
@@ -174,8 +183,28 @@ async def export_pdf(file: UploadFile = File(..., description="SVG document")):
     except UnicodeDecodeError as exc:
         raise InvalidSvgError("The SVG was not valid UTF-8 text.") from exc
 
-    pdf = svg_to_pdf(svg)
+    if separations:
+        pdf = svg_to_separations_pdf(svg, knockout=knockout)
+    else:
+        pdf = svg_to_pdf(svg)
     return Response(content=pdf, media_type="application/pdf")
+
+
+@app.post(
+    "/import",
+    responses={400: {"model": ErrorResponse}, 415: {"model": ErrorResponse}},
+)
+async def import_vector(
+    file: UploadFile = File(..., description="PDF, Illustrator (.ai) or CorelDRAW (.cdr)"),
+):
+    """Convert an existing vector document to SVG - see ``vector_import``.
+
+    Feeds the website's vector-to-colour-separation flow. Inkscape is slow and
+    blocking, so it runs in the threadpool rather than on the event loop.
+    """
+    data = await file.read()
+    svg, meta = await run_in_threadpool(import_vector_file, data, file.filename or "")
+    return {"success": True, "svg": svg, "meta": meta}
 
 
 if __name__ == "__main__":

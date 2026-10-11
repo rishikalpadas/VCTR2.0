@@ -45,5 +45,10 @@ class Settings(BaseSettings):
     # VEC_STYLE_CLASSIFIER=false turns it off even then.
     style_classifier: bool = True
 
+    # --- vector import (see vector_import.py) -------------------------------
+    # Inkscape binary for PDF / AI / CDR -> SVG. Empty means look on PATH,
+    # then in Program Files on Windows.
+    inkscape_path: str = ""
+
 
 settings = Settings()

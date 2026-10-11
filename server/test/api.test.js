@@ -317,6 +317,29 @@ test('POST /api/export/pdf returns a vector PDF', async (t) => {
   return undefined;
 });
 
+test('POST /api/export/pdf?separations=true returns one page per colour', async (t) => {
+  if (!engineUp) return t.skip('Python engine not running');
+
+  const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="300" height="200">'
+    + '<rect width="200" height="100" fill="#678fb8"/>'
+    + '<rect x="50" y="50" width="200" height="100" fill="#7a6248"/>'
+    + '<path d="M10 190 L290 10" stroke="#1a1a1a" stroke-width="8" fill="none"/>'
+    + '</svg>';
+
+  const res = await fetch(`${baseUrl}/api/export/pdf?name=stamp&separations=true`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'image/svg+xml' },
+    body: svg,
+  });
+
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-disposition'), /filename="stamp-separations\.pdf"/);
+
+  const pdf = Buffer.from(await res.arrayBuffer()).toString('latin1');
+  assert.equal((pdf.match(/\/Type\s*\/Page(?!s)/g) || []).length, 3, 'expected 3 plates');
+  return undefined;
+});
+
 test('POST /api/export/pdf refuses an SVG with entity declarations', async (t) => {
   if (!engineUp) return t.skip('Python engine not running');
 
