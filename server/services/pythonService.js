@@ -174,13 +174,15 @@ async function vectorize({ filePath, detectedType, preset, options }) {
  * repeating a multi-second trace. The engine re-validates it as untrusted
  * input regardless of where it claims to have come from.
  *
+ * @param {string} svg
+ * @param {{ separations?: boolean }} [options] separations: one page per colour
  * @returns {Promise<Buffer>} the PDF bytes
  */
-async function exportPdf(svg) {
+async function exportPdf(svg, { separations = false } = {}) {
   const form = new FormData();
   form.append('file', new Blob([svg], { type: 'image/svg+xml' }), 'artwork.svg');
 
-  const url = `${config.python.baseUrl}/export/pdf`;
+  const url = `${config.python.baseUrl}/export/pdf${separations ? '?separations=true' : ''}`;
   const startedAt = Date.now();
 
   const response = await fetchWithTimeout(

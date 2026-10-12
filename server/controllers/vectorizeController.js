@@ -139,7 +139,10 @@ async function vectorize(req, res, next) {
   }
 }
 
-/** POST /api/export/pdf - body is the SVG text, response is the PDF. */
+/**
+ * POST /api/export/pdf - body is the SVG text, response is the PDF.
+ * ?separations=true returns colour separations, one page per ink.
+ */
 async function exportPdf(req, res, next) {
   try {
     const svg = typeof req.body === 'string' ? req.body : '';
@@ -160,8 +163,11 @@ async function exportPdf(req, res, next) {
       throw ApiError.badRequest('INVALID_SVG', 'That does not look like an SVG document.');
     }
 
-    const pdf = await pythonService.exportPdf(svg);
-    const name = sanitizeFilename(req.query.name) || 'artwork';
+    // ?separations=true gives one page per colour instead of the composite.
+    const separations = ['1', 'true'].includes(String(req.query.separations));
+    const pdf = await pythonService.exportPdf(svg, { separations });
+    const name = (sanitizeFilename(req.query.name) || 'artwork')
+      + (separations ? '-separations' : '');
 
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Length', pdf.length);

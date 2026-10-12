@@ -34,7 +34,7 @@
     'vectorizeBtn', 'progress',
     'progressDetail', 'errorBox', 'errorTitle', 'errorMessage', 'errorCode',
     'warningBox', 'warningList', 'resultPanel', 'originalPreview', 'svgPreview',
-    'statsGrid', 'downloadBtn', 'downloadPdfBtn', 'openBtn', 'copyBtn', 'metaDump',
+    'statsGrid', 'downloadBtn', 'downloadPdfBtn', 'downloadSepBtn', 'openBtn', 'copyBtn', 'metaDump',
     'engineStatus',
   ].forEach(function (id) { el[id] = document.getElementById(id); });
 
@@ -338,19 +338,22 @@
 
   /**
    * PDF is produced server-side from the SVG we already have, so it matches
-   * the preview exactly and costs no re-trace.
+   * the preview exactly and costs no re-trace. With `separations` it is one
+   * page per colour instead, for screen printing.
    */
-  function downloadPdf() {
+  function downloadPdf(separations) {
     if (!state.svgText || state.exporting) return;
 
-    var button = el.downloadPdfBtn;
+    var button = separations ? el.downloadSepBtn : el.downloadPdfBtn;
     var original = button.textContent;
+    var fileName = baseName() + (separations ? '-separations' : '') + '.pdf';
     state.exporting = true;
     button.disabled = true;
-    button.textContent = 'Preparing PDF…';
+    button.textContent = separations ? 'Separating colours…' : 'Preparing PDF…';
     clearError();
 
-    fetch(API.exportPdf + '?name=' + encodeURIComponent(baseName()), {
+    fetch(API.exportPdf + '?name=' + encodeURIComponent(baseName())
+      + (separations ? '&separations=true' : ''), {
       method: 'POST',
       headers: { 'Content-Type': 'image/svg+xml' },
       body: state.svgText,
@@ -368,7 +371,7 @@
           });
       })
       .then(function (blob) {
-        triggerDownload(URL.createObjectURL(blob), baseName() + '.pdf', true);
+        triggerDownload(URL.createObjectURL(blob), fileName, true);
       })
       .catch(function (err) {
         showError(err.message || 'Could not export the PDF.', err.code || 'PDF_EXPORT_FAILED');
@@ -443,7 +446,8 @@
   el.clearBtn.addEventListener('click', clearFile);
   el.vectorizeBtn.addEventListener('click', vectorize);
   el.downloadBtn.addEventListener('click', downloadSvg);
-  el.downloadPdfBtn.addEventListener('click', downloadPdf);
+  el.downloadPdfBtn.addEventListener('click', function () { downloadPdf(false); });
+  el.downloadSepBtn.addEventListener('click', function () { downloadPdf(true); });
   el.copyBtn.addEventListener('click', copySvg);
 
   el.openBtn.addEventListener('click', function () {

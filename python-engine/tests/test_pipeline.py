@@ -13,6 +13,7 @@ import sys
 import unittest
 import unittest.mock
 import xml.etree.ElementTree as ET
+import zipfile
 from pathlib import Path
 
 # Make the service modules importable when running from tests/, and this
@@ -44,9 +45,18 @@ from presets import apply_overrides, get_preset  # noqa: E402
 from svg_export import (  # noqa: E402
     MAX_SVG_BYTES,
     _count_curve_operators,
+    _plate_svg,
+    separation_colours,
     svg_to_pdf,
+    svg_to_separations_pdf,
 )
 from svg_optimizer import validate_svg  # noqa: E402
+from vector_import import (  # noqa: E402
+    _find_inkscape,
+    detect_format,
+    import_vector_file,
+    sanitize_svg,
+)
 from vectorizer import vectorize_bytes  # noqa: E402
 from engines import centerline  # noqa: E402
 from engines.potrace_engine import (  # noqa: E402
@@ -544,6 +554,164 @@ class TestPdfExport(unittest.TestCase):
     def test_rejects_empty_input(self):
         with self.assertRaises(InvalidSvgError):
             svg_to_pdf("   ")
+
+
+class TestColourSeparations(unittest.TestCase):
+    """One page per ink, knocked out, all pages in register."""
+
+    # Blue wash under brown bars under a black stroke - the stamp layout.
+    STAMP = (
+        '<svg xmlns="http://www.w3.org/2000/svg" width="600" height="400" '
+        'viewBox="0 0 600 400">'
+        '<path fill="#678fb8" d="M60 200 C60 100 540 100 540 200 '
+        'C540 300 60 300 60 200z"/>'
+        '<g fill="#7a6248"><rect x="200" y="60" width="200" height="40"/>'
+        '<rect x="180" y="180" width="240" height="40"/></g>'
+        '<path style="fill:none;stroke:#1a1a1a" stroke-width="10" '
+        'd="M100 320 C200 100 300 380 520 140"/>'
+        '</svg>'
+    )
+
+    @staticmethod
+    def pages(pdf: bytes) -> int:
+        return len(re.findall(rb"/Type\s*/Page(?!s)", pdf))
+
+    @staticmethod
+    def paints(svg: bytes) -> list[tuple[str, str]]:
+        root = ET.fromstring(svg)
+        return [
+            (e.get("fill"), e.get("stroke"))
+            for e in root.iter()
+            if e.tag.rsplit("}", 1)[-1] in ("path", "rect")
+        ]
+
+    def test_finds_fills_strokes_and_inherited_colours_darkest_first(self):
+        self.assertEqual(
+            separation_colours(self.STAMP), ["#1a1a1a", "#7a6248", "#678fb8"]
+        )
+
+    def test_unpainted_shape_counts_as_black(self):
+        svg = '<svg xmlns="http://www.w3.org/2000/svg"><rect width="5" height="5"/></svg>'
+        self.assertEqual(separation_colours(svg), ["#000000"])
+
+    def test_one_page_per_colour_all_the_same_size(self):
+        pdf = svg_to_separations_pdf(self.STAMP)
+        self.assertEqual(self.pages(pdf), 3)
+        boxes = set(re.findall(rb"/MediaBox\s*\[[^\]]*\]", pdf))
+        self.assertEqual(len(boxes), 1, f"plates out of register: {boxes}")
+        self.assertIsNone(re.search(rb"/Subtype\s*/Image", pdf))
+
+    def test_bottom_plate_is_knocked_out_by_everything_above_it(self):
+        plate = self.paints(_plate_svg(self.STAMP, "#678fb8", "#678fb8", True))
+        self.assertEqual(
+            plate,
+            [
+                ("#678fb8", "none"),
+                ("#ffffff", "none"),
+                ("#ffffff", "none"),
+                ("none", "#ffffff"),
+            ],
+        )
+
+    def test_top_plate_drops_what_lies_underneath(self):
+        plate = self.paints(_plate_svg(self.STAMP, "#1a1a1a", "#1a1a1a", True))
+        self.assertEqual(plate, [("none", "#1a1a1a")])
+
+    def test_overprint_keeps_each_colour_whole(self):
+        plate = self.paints(_plate_svg(self.STAMP, "#678fb8", "#678fb8", False))
+        self.assertEqual(plate, [("#678fb8", "none")])
+
+    def test_traced_artwork_gives_one_plate_per_palette_colour(self):
+        outcome = vectorize_bytes(png_bytes(donut()), preset_name="flat_art")
+        fills = set(re.findall(r'fill="(#[0-9a-fA-F]{6})"', outcome.svg))
+        pdf = svg_to_separations_pdf(outcome.svg)
+        self.assertEqual(self.pages(pdf), len({f.lower() for f in fills}))
+
+    def test_rejects_gradients(self):
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg">'
+            '<rect width="5" height="5" fill="url(#g)"/></svg>'
+        )
+        with self.assertRaises(InvalidSvgError):
+            svg_to_separations_pdf(svg)
+
+    def test_rejects_artwork_with_no_colour(self):
+        svg = '<svg xmlns="http://www.w3.org/2000/svg"><rect fill="none"/></svg>'
+        with self.assertRaises(InvalidSvgError):
+            svg_to_separations_pdf(svg)
+
+
+class TestVectorImport(unittest.TestCase):
+    """PDF / AI / CDR in, sanitized SVG out."""
+
+    def test_detects_formats_from_magic_bytes(self):
+        self.assertEqual(detect_format(b"%PDF-1.7\n..."), "pdf")
+        self.assertEqual(detect_format(b"RIFF\x00\x00\x00\x00CDRBvrsn"), "cdr")
+        zipped = io.BytesIO()
+        with zipfile.ZipFile(zipped, "w") as archive:
+            archive.writestr("content/riffData.cdr", b"RIFF")
+        self.assertEqual(detect_format(zipped.getvalue()), "cdr")
+
+    def test_refuses_legacy_postscript_illustrator_and_junk(self):
+        for data in (b"%!PS-Adobe-3.0", b"hello world", b"PK\x03\x04broken"):
+            with self.assertRaises(UnsupportedFormatError):
+                detect_format(data)
+
+    def test_sanitize_drops_active_and_external_content(self):
+        svg, removed = sanitize_svg(
+            b'<svg xmlns="http://www.w3.org/2000/svg" '
+            b'xmlns:xlink="http://www.w3.org/1999/xlink" onload="alert(1)">'
+            b'<script>alert(1)</script><foreignObject/>'
+            b'<image xlink:href="http://169.254.169.254/x"/>'
+            b'<image xlink:href="data:image/png;base64,AAAA"/>'
+            b'<use href="#a"/><path id="a" d="M0 0h1v1z"/></svg>'
+        )
+        self.assertNotIn("script", svg)
+        self.assertNotIn("foreignObject", svg)
+        self.assertNotIn("onload", svg)
+        self.assertNotIn("169.254", svg)
+        self.assertIn("data:image/png", svg)
+        self.assertIn('href="#a"', svg)
+        self.assertEqual(
+            removed, {"elements": 2, "attributes": 1, "links": 1, "frames": 0}
+        )
+
+    FRAME = (
+        '<path d="M 0.5,662.9 H 611.3 V 132.3 H 0.5 Z" '
+        'style="fill:none;stroke:#000000;stroke-width:0.216" '
+        'transform="matrix(1.3333333,0,0,-1.3333333,0,1056)"/>'
+    )
+
+    def test_drops_the_hairline_artboard_frame(self):
+        """Illustrator's 0.2pt page border must not land on the black film."""
+        svg, removed = sanitize_svg(
+            (
+                '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 816 1056">'
+                + self.FRAME
+                + '<path d="M100 300 H700 V700 H100 Z" fill="none" stroke="#1a1a18" stroke-width="6"/>'
+                '<path d="M300 400 H500 V500 H300 Z" fill="none" stroke="#1a1a18" stroke-width="0.2"/>'
+                "</svg>"
+            ).encode()
+        )
+        self.assertEqual(removed["frames"], 1)
+        self.assertNotIn("#000000", svg)
+        # A thick box, and a hairline box that is not page-sized, are artwork.
+        self.assertEqual(svg.count("#1a1a18"), 2)
+
+    @unittest.skipUnless(_find_inkscape(), "Inkscape not installed")
+    def test_converts_a_pdf_to_svg(self):
+        from reportlab.pdfgen.canvas import Canvas
+
+        buffer = io.BytesIO()
+        pdf = Canvas(buffer, pagesize=(200, 100))
+        pdf.setFillColorRGB(0.4, 0.56, 0.72)
+        pdf.rect(10, 10, 80, 80, stroke=0, fill=1)
+        pdf.save()
+
+        svg, meta = import_vector_file(buffer.getvalue(), "box.pdf")
+        self.assertEqual(meta["format"], "pdf")
+        self.assertEqual(ET.fromstring(svg).tag, "{http://www.w3.org/2000/svg}svg")
+        self.assertIn("<path", svg)
 
 
 class TestDeterminism(unittest.TestCase):
