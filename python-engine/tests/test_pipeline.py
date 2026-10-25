@@ -53,6 +53,8 @@ from svg_export import (  # noqa: E402
 from svg_optimizer import validate_svg  # noqa: E402
 from vector_import import (  # noqa: E402
     _find_inkscape,
+    _first_page_args,
+    _inkscape_version,
     detect_format,
     import_vector_file,
     sanitize_svg,
@@ -67,6 +69,17 @@ from engines.potrace_engine import (  # noqa: E402
 )
 
 SAMPLES = Path(__file__).resolve().parents[2] / "samples"
+
+
+def setUpModule():
+    # These tests pin the tracing pipeline itself, on small synthetic shapes
+    # that the AI upscale would otherwise pick up as "small images" and
+    # rebuild first. enhance.py has its own tests (test_enhance.py).
+    from config import settings
+
+    patcher = unittest.mock.patch.object(settings, "enhance", False)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 def png_bytes(image: Image.Image) -> bytes:
@@ -712,6 +725,20 @@ class TestVectorImport(unittest.TestCase):
         self.assertEqual(meta["format"], "pdf")
         self.assertEqual(ET.fromstring(svg).tag, "{http://www.w3.org/2000/svg}svg")
         self.assertIn("<path", svg)
+
+    def test_first_page_option_matches_the_inkscape_version(self):
+        """Regression: Inkscape 1.2.2 refused every import over --pages=1."""
+        self.assertEqual(_first_page_args((1, 2), "pdf"), ["--pdf-page=1"])
+        self.assertEqual(_first_page_args((1, 2), "cdr"), [])
+        self.assertEqual(_first_page_args((1, 3), "pdf"), ["--pages=1"])
+        self.assertEqual(_first_page_args((1, 4), "cdr"), ["--pages=1"])
+        self.assertEqual(_first_page_args(None, "pdf"), ["--pages=1"])
+
+    @unittest.skipUnless(_find_inkscape(), "Inkscape not installed")
+    def test_reads_the_installed_inkscape_version(self):
+        version = _inkscape_version(_find_inkscape())
+        self.assertIsNotNone(version)
+        self.assertGreaterEqual(version, (1, 0))
 
 
 class TestDeterminism(unittest.TestCase):

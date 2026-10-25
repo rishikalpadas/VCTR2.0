@@ -77,6 +77,25 @@ download on first use (LAION CLIP ViT-B-32, safetensors). Turn it off with
 `VEC_STYLE_CLASSIFIER=false`. Rebuild its reference file from labelled
 images with `python tools\train_style_classifier.py <folder>`.
 
+### AI upscale of blurry uploads (built in)
+
+Soft, blocky or small uploads are rebuilt with Real-ESRGAN before they are
+traced (`python-engine/enhance.py`), so Potrace gets sharp edges and flat
+colours instead of blur ramps and JPEG staircases. Nothing to install: the two
+compact models (~7 MB, BSD-3) ship in `python-engine/models/sr/` as ONNX and
+run on OpenCV's own dnn module, on CPU, in about 0.3-1.5 s.
+
+It runs only when the image needs it - edge blur at least 1.4x a sharp edge,
+or under ~700px of real detail - and reports what it did in `meta.enhance`.
+Before upscaling, the image is reduced to the resolution it really holds
+(estimated from the blur): at that size a blocky diagonal is a clean aliased
+line the model rebuilds smoothly, where at full size it would sharpen the
+staircase. Colours are pulled back to the source afterwards. Turn it off
+server-wide with `VEC_ENHANCE=false`, or per request with `enhance=never`.
+Rebuild the models from the official weights with
+`python tools\export_sr_models.py <folder of .pth files>` (needs torch, in a
+separate venv - see the script).
+
 > **Use Python 3.12 or 3.13, not 3.14.** VTracer publishes wheels up to
 > CPython 3.13. On 3.14 pip tries to build the Rust core from source and fails
 > unless you have a Rust toolchain. Check with `py -0p`.
@@ -163,6 +182,7 @@ Node API itself is healthy, and the frontend uses this to drive the badge.
 | `image` | yes | PNG, JPG/JPEG or WebP, ≤ 15 MB |
 | `preset` | no | `auto` (default), `standard`, `logo`, `flat_art`, `typography`, `line_art`, `detailed` |
 | `background` | no | `auto`, `always`, `never` |
+| `enhance` | no | `auto` (default), `always`, `never`. AI upscale + restore of soft or low-resolution uploads before tracing - see *AI upscale of blurry uploads* below. |
 | `remove_enclosed_background` | no | `true` to knock out letter counters |
 | `max_dimension` | no | working resolution of the artwork |
 | `supersample` | no | `1`–`3`. Trace at this multiple of the working resolution, then scale back via the viewBox. |

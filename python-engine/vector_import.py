@@ -86,6 +86,38 @@ def _find_inkscape() -> str | None:
     return None
 
 
+_VERSION_RE = re.compile(r"Inkscape (\d+)\.(\d+)")
+_versions: dict[str, tuple[int, int] | None] = {}
+
+
+def _inkscape_version(inkscape: str) -> tuple[int, int] | None:
+    """``(major, minor)`` from ``inkscape --version``, cached per binary."""
+    if inkscape not in _versions:
+        try:
+            proc = subprocess.run([inkscape, "--version"], capture_output=True, timeout=30)
+            text = (proc.stdout + proc.stderr).decode("utf-8", "replace")
+            match = _VERSION_RE.search(text)
+            _versions[inkscape] = (int(match[1]), int(match[2])) if match else None
+        except (OSError, subprocess.TimeoutExpired):
+            _versions[inkscape] = None
+        log.info("Inkscape %s -> version %s", inkscape, _versions[inkscape])
+    return _versions[inkscape]
+
+
+def _first_page_args(version: tuple[int, int] | None, fmt: str) -> list[str]:
+    """Inkscape arguments that limit the import to the first page.
+
+    ``--pages`` arrived with multi-page documents in Inkscape 1.3. 1.0 - 1.2
+    (Debian 12 and Ubuntu 24.04 still ship 1.2.2) stop with "Unknown option
+    --pages=1" before reading the file, and pick the page with the PDF
+    importer's ``--pdf-page`` instead. CorelDRAW needs nothing there: 1.2
+    imports only the first page anyway.
+    """
+    if version is None or version >= (1, 3):
+        return ["--pages=1"]
+    return ["--pdf-page=1"] if fmt == "pdf" else []
+
+
 def detect_format(data: bytes) -> str:
     """``"pdf"`` or ``"cdr"``; raises for anything else."""
     head = data[:1024]
@@ -339,7 +371,7 @@ def import_vector_file(data: bytes, filename: str = "") -> tuple[str, dict]:
         source.write_bytes(data)
         command = [
             inkscape,
-            "--pages=1",
+            *_first_page_args(_inkscape_version(inkscape), fmt),
             "--export-type=svg",
             "--export-plain-svg",
             "--export-text-to-path",

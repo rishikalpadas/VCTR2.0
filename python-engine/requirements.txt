@@ -33,6 +33,10 @@ vtracer==0.6.15
 # vendor/potrace/potrace.exe (downloaded from potrace.sourceforge.net,
 # verified against its published SHA1SUMS) - nothing to install.
 
+# --- AI upscale of blurry uploads (enhance.py) -----------------------------
+# No package of its own: the Real-ESRGAN models in models/sr/ are ONNX graphs
+# run by opencv-python-headless's dnn module, above.
+
 # --- SVG optimization ------------------------------------------------------
 scour==0.38.2
 

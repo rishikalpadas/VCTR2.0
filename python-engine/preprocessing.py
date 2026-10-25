@@ -56,6 +56,7 @@ def preprocess(
     params: PreprocessParams,
     analysis: ImageAnalysis,
     source_format: str = "png",
+    enhanced: bool = False,
 ) -> PreprocessResult:
     """Prepare an image for tracing.
 
@@ -69,6 +70,13 @@ def preprocess(
       6. supersample                - AFTER denoise, so noise is not magnified
       7. colour quantization        - on clean, smooth-ramped pixels
       8. binarization
+
+    ``enhanced`` marks an image already rebuilt at high resolution by
+    ``enhance.py``. Steps 1 and 6 then become a single resize straight to the
+    traced size: reducing it to the working resolution and interpolating back
+    up would throw away exactly the detail the model put there. It still
+    counts as supersampled by the preset's factor, so every output-pixel
+    setting keeps its meaning.
     """
     steps: list[str] = []
     warnings: list[str] = []
@@ -85,8 +93,13 @@ def preprocess(
         else (None, None)
     )
 
-    params = _skip_lossy_downscale(params, original_width, original_height)
-    working, base_scale = _resize(rgba, params, steps)
+    if enhanced:
+        working, base_scale, presampled = _fit_enhanced(rgba, params, steps)
+        params = replace(params, supersample=1.0)
+    else:
+        params = _skip_lossy_downscale(params, original_width, original_height)
+        working, base_scale = _resize(rgba, params, steps)
+        presampled = 1.0
     working = _clamp_border(working)
 
     if params.jpeg_cleanup and source_format in ("jpeg", "webp"):
@@ -113,6 +126,7 @@ def preprocess(
         steps.append(f"median_blur({kernel})")
 
     working, supersample = _supersample(working, params, steps)
+    supersample *= presampled
 
     if params.quantize_colors is not None:
         # Kept for _dissolve_edge_films: once the palette has been written the
@@ -140,6 +154,7 @@ def preprocess(
                 # above: _restore_linework converts it to source pixels itself
                 # using the scale it can see.
                 max_width=params.linework_max_width,
+                source=rgba,
             )
             if restored:
                 steps.append(f"linework_restored({restored:,}px)")
@@ -210,6 +225,34 @@ def _resize(
     resized = cv2.resize(rgba, new_size, interpolation=interpolation)
     steps.append(f"resize({width}x{height}->{new_size[0]}x{new_size[1]})")
     return resized, scale
+
+
+def _fit_enhanced(
+    rgba: np.ndarray, params: PreprocessParams, steps: list[str]
+) -> tuple[np.ndarray, float, float]:
+    """Resize an enhanced image straight to the size the preset traces at.
+
+    That is the working resolution times the supersample factor, within the
+    absolute cap, and never below what ``min_dimension_upscale`` would have
+    produced. Returns the image, its scale, and the supersample factor it
+    stands for.
+    """
+    height, width = rgba.shape[:2]
+    longest = max(height, width)
+    factor = max(1.0, float(params.supersample))
+    ceiling = min(params.max_dimension * factor, settings.absolute_max_dimension)
+    floor = min(params.min_dimension_upscale * factor, ceiling)
+    target = min(max(longest, floor), ceiling)
+
+    if target == longest:
+        steps.append(f"enhanced_fit({width}x{height})")
+        return rgba, 1.0, factor
+    scale = target / longest
+    new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    resized = cv2.resize(rgba, new_size, interpolation=interpolation)
+    steps.append(f"enhanced_fit({width}x{height}->{new_size[0]}x{new_size[1]})")
+    return resized, scale, factor
 
 
 def _skip_lossy_downscale(
@@ -827,6 +870,20 @@ def _luma(rgb: np.ndarray) -> np.ndarray:
     return rgb.astype(np.float32) @ weights
 
 
+def _ink_window(shape: tuple[int, ...], radius: int = 0) -> np.ndarray:
+    """Neighbourhood that reaches across a stroke at source resolution.
+
+    The window has to reach across the stroke to the fills on either side, and
+    no further. Too wide and it finds some *other*, lighter colour nearby,
+    which drags the midpoint up until the fill next to the stroke falls below
+    it and gets swallowed - the stroke comes back too heavy.
+    """
+    radius = radius or max(2, round(max(shape[:2]) / 800))
+    return cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
+    )
+
+
 def _ink_mask(
     rgba: np.ndarray, max_luma: int, min_contrast: float, radius: int = 0
 ) -> np.ndarray:
@@ -850,14 +907,7 @@ def _ink_mask(
     region.
     """
     luma = _luma(rgba[..., :3])
-    # The window has to reach across the stroke to the fills on either side,
-    # and no further. Too wide and it finds some *other*, lighter colour
-    # nearby, which drags the midpoint up until the fill next to the stroke
-    # falls below it and gets swallowed - the stroke comes back too heavy.
-    radius = radius or max(2, round(max(luma.shape) / 800))
-    kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1)
-    )
+    kernel = _ink_window(luma.shape, radius)
     lightest = cv2.dilate(luma, kernel)
     darkest = cv2.erode(luma, kernel)
 
@@ -942,14 +992,32 @@ def _restore_linework(
     sigma: float,
     threshold: float,
     max_width: float,
+    source: np.ndarray | None = None,
 ) -> tuple[np.ndarray, int]:
     """Stamp line work the pipeline lost back onto the quantized image.
 
-    Only pixels that were ink in the source *and* no longer carry any dark
-    palette entry are touched, so solid dark regions keep whichever dark entry
-    quantization gave them. The stamp always reuses an existing palette entry,
-    so this can never introduce a colour - and therefore never an extra traced
-    layer - that quantization did not already produce.
+    Only pixels that were ink in the source *and* do not carry the dark
+    palette entry that matches that ink are touched. The stamp always reuses
+    an existing palette entry, so this can never introduce a colour - and
+    therefore never an extra traced layer - that quantization did not already
+    produce.
+
+    Which dark entry is the stroke's own colour is read from ``source``: the
+    darkest colour within the stroke's reach, matched to the nearest dark
+    entry. Both halves of that matter:
+
+    * A stroke that quantization split between the ink and an in-between dark
+      grey (the blend of the ink with a pale band beside it) used to count as
+      "already dark" wherever it had the grey, and was left half grey, half
+      ink. Each colour is traced as its own layer, so the line came back as
+      dashes - the double outline on a sketched letter broke up all along its
+      length. Measured on that artwork, the grey was not dropped as a blend
+      because the pale band beside it was only twice its size, not the 3x
+      _blend_centers asks for.
+    * A lost stroke used to be stamped with the *darkest* entry whatever its
+      colour, so a thin navy rule next to black ink came back black.
+
+    Without ``source`` every stroke gets the darkest entry, as before.
 
     Restricted to *thin* ink, and that restriction is load-bearing. A dark
     shape wide enough to survive the pipeline on its own has already had its
@@ -988,19 +1056,43 @@ def _restore_linework(
 
     result = rgba.copy()
     rgb = result[..., :3]
+    target = _stroke_colours(source, palette, dark, (width, height))
+    if target is None:
+        target = np.broadcast_to(palette[dark[int(np.argmin(luma[dark]))]], rgb.shape)
 
-    already_dark = np.zeros((height, width), dtype=bool)
-    for index in dark:
-        already_dark |= np.all(rgb == palette[index], axis=-1)
-
-    lost = ink & ~already_dark
+    lost = ink & np.any(rgb != target, axis=-1)
     if result.shape[2] == 4:
         lost &= result[..., 3] > 0
     if not lost.any():
         return rgba, 0
 
-    rgb[lost] = palette[dark[int(np.argmin(luma[dark]))]]
+    rgb[lost] = target[lost]
     return result, int(lost.sum())
+
+
+def _stroke_colours(
+    source: np.ndarray | None,
+    palette: np.ndarray,
+    dark: np.ndarray,
+    size: tuple[int, int],
+) -> np.ndarray | None:
+    """Per traced pixel, the dark palette entry nearest the local stroke colour.
+
+    The stroke colour is the per-channel minimum over the same window
+    _ink_mask uses - the core of whatever stroke passes nearby, since ink is
+    darker than what it is drawn on in every channel. Matched at source
+    resolution and resampled by nearest neighbour, so only palette colours
+    come out. None when there is no source or only one dark entry to choose
+    from.
+    """
+    if source is None or dark.size < 2:
+        return None
+    core = cv2.erode(source[..., :3], _ink_window(source.shape)).astype(np.float32)
+    entries = palette[dark].astype(np.float32)
+    distance = ((core[:, :, None, :] - entries[None, None, :, :]) ** 2).sum(axis=-1)
+    nearest = np.argmin(distance, axis=-1).astype(np.uint8)
+    nearest = cv2.resize(nearest, size, interpolation=cv2.INTER_NEAREST)
+    return palette[dark][nearest]
 
 
 def _quantize(

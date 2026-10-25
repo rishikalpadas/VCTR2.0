@@ -45,6 +45,11 @@ class Settings(BaseSettings):
     # VEC_STYLE_CLASSIFIER=false turns it off even then.
     style_classifier: bool = True
 
+    # --- AI upscale of soft / low-resolution uploads (see enhance.py) -------
+    # Runs only on images that need it, with the bundled ONNX models.
+    # VEC_ENHANCE=false turns it off for every request.
+    enhance: bool = True
+
     # --- vector import (see vector_import.py) -------------------------------
     # Inkscape binary for PDF / AI / CDR -> SVG. Empty means look on PATH,
     # then in Program Files on Windows.

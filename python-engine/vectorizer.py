@@ -3,6 +3,7 @@
     bytes
       -> load + validate        (image_io)
       -> analyze                (analysis)
+      -> enhance if soft/small  (enhance - AI upscale, then re-analyze)
       -> resolve preset         (presets / analysis.choose_preset)
       -> preprocess             (preprocessing -> background)
       -> vectorize              (engines.registry)
@@ -19,6 +20,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field, replace
 
+import enhance
 import style_classifier
 from analysis import ImageKind, analyze, choose_preset
 from engines import registry
@@ -67,6 +69,19 @@ def vectorize_bytes(
     # 2. Analyze ------------------------------------------------------------
     analysis = analyze(rgba)
 
+    # 2b. Enhance -----------------------------------------------------------
+    # Before the preset is chosen: a blurry upload reads as gradients and
+    # many colours, and would be routed as if it were painted. The SVG keeps
+    # the source's dimensions either way - only the traced pixels change.
+    enhanced = enhance.enhance(
+        rgba,
+        mode=enhance.parse_mode((overrides or {}).get("enhance")),
+        photographic=analysis.kind in _APPROXIMATION_KINDS,
+    )
+    if enhanced.applied:
+        rgba = enhanced.image
+        analysis = analyze(rgba)
+
     # 3. Resolve the preset -------------------------------------------------
     requested = preset_name or AUTO_PRESET_NAME
     style = None
@@ -114,8 +129,8 @@ def vectorize_bytes(
         # when it costs little extra path data: on clean edges there is
         # nothing extra for it to trace (the WEAKNESS sticker: 0.99x).
         standard_sigma = preset.preprocess.boundary_smooth_sigma
-        light_run = _trace(rgba, light, analysis, info)
-        standard_run = _trace(rgba, preset, analysis, info)
+        light_run = _trace(rgba, light, analysis, info, enhanced.applied)
+        standard_run = _trace(rgba, preset, analysis, info, enhanced.applied)
         light_bytes = light_run[2].bytes_after
         standard_bytes = standard_run[2].bytes_after
         use_light = light_bytes <= standard_bytes * POTRACE_LIGHT_SMOOTH_MAX_GROWTH
@@ -131,7 +146,9 @@ def vectorize_bytes(
             "standard_svg_bytes": standard_bytes,
         }
     else:
-        prepared, engine_result, optimized = _trace(rgba, preset, analysis, info)
+        prepared, engine_result, optimized = _trace(
+            rgba, preset, analysis, info, enhanced.applied
+        )
     warnings.extend(prepared.warnings)
     warnings.extend(optimized.warnings)
 
@@ -171,6 +188,7 @@ def vectorize_bytes(
         "background": prepared.background,
         "analysis": analysis.to_dict(),
         "engine_meta": engine_result.meta,
+        "enhance": enhanced.report,
         "warnings": warnings,
     }
     if smoothing_report is not None:
@@ -188,10 +206,15 @@ def vectorize_bytes(
     return VectorizeOutcome(svg=optimized.svg, meta=meta)
 
 
-def _trace(rgba, preset, analysis, info):
+def _trace(rgba, preset, analysis, info, enhanced=False):
     """Preprocess, vectorize and finalize with one preset."""
     prepared = preprocess(
-        rgba, preset.preprocess, analysis, source_format=info["format"]
+        rgba,
+        preset.preprocess,
+        analysis,
+        # The model's output carries no JPEG blocking left to clean up.
+        source_format="png" if enhanced else info["format"],
+        enhanced=enhanced,
     )
 
     # Supersampling changes the pixel scale the engine works in, so its

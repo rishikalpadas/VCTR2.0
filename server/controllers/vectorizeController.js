@@ -26,8 +26,10 @@ const NUMBER_OPTIONS = [
   'turdsize',
 ];
 const FLOAT_OPTIONS = ['supersample', 'boundary_smooth_sigma', 'alphamax', 'opttolerance'];
-const STRING_OPTIONS = ['background', 'turnpolicy'];
+const STRING_OPTIONS = ['background', 'turnpolicy', 'enhance'];
 const VALID_BACKGROUND_MODES = new Set(['auto', 'always', 'never']);
+// AI upscale of soft / low-resolution uploads (python-engine/enhance.py).
+const VALID_ENHANCE_MODES = new Set(['auto', 'always', 'never']);
 const VALID_TURN_POLICIES = new Set(['black', 'white', 'left', 'right', 'minority', 'majority', 'random']);
 
 // Forces a specific tracing backend onto whatever preset was chosen, holding
@@ -68,6 +70,7 @@ function parseOptions(body) {
     const value = String(body[key]);
     if (key === 'background' && !VALID_BACKGROUND_MODES.has(value)) continue;
     if (key === 'turnpolicy' && !VALID_TURN_POLICIES.has(value)) continue;
+    if (key === 'enhance' && !VALID_ENHANCE_MODES.has(value)) continue;
     options[key] = value;
   }
 
